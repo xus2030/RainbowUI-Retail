@@ -1,42 +1,14 @@
 local _, ns = ...
 
--------------------------------------------------------------------------------
--- SlotIcon: polished slot-style item icon with corner markers.
---
--- Renders an item icon inside a chunky Blizzard "UI-Quickslot2" bevel
--- frame, layered the way KeystoneLoot's icon button does it:
---
---   layer       sublvl   what                                  visible role
---   ARTWORK     -1       auctionhouse-itemicon-empty (alpha)   empty/loading
---   ARTWORK     0        item icon texture                     the item art
---   ARTWORK     1        UI-Quickslot2, sized ~1.8x the icon   the chunky bevel
---   OVERLAY     1        corner markers (BiS, owned, etc.)     status badges
---
--- Why this shape: a bare 40x40 texture with a same-size slot frame ends
--- up looking ungrounded — the Blizzard frame's outer corners barely
--- extend past the icon edge, so the bevel reads as a thin line. KL's
--- icon button sizes the frame texture ~1.8x the icon, drops the
--- TexCoord crop, and the chunky corners pop. We replicate that here so
--- every section that needs a "real" item slot can call into one helper
--- and get identical visuals.
---
--- Future tabs (Gear/Trinkets/Enhancements card variants) can adopt this
--- helper by calling ns.CreateSlotIcon(parent, { size = N }) and setting
--- markers via ns.SlotIconMarkers presets — no per-tab divergence.
--------------------------------------------------------------------------------
-
-local DEFAULT_ICON_SIZE   = 32
-local DEFAULT_SLOT_RATIO  = 1.8125 -- KL reminder ratio (58/32); 52/28 ≈ 1.857
-local DEFAULT_ICON_TRIM   = 0.08   -- matches KL's TexCoord crop
+local DEFAULT_ICON_SIZE = 32
+local DEFAULT_SLOT_RATIO = 1.8125
+local DEFAULT_ICON_TRIM = 0.08
 local DEFAULT_MARKER_SIZE = 20
-local DEFAULT_MARKER_INSET = 7     -- corners sit this far outside the icon
-local EMPTY_ATLAS         = "auctionhouse-itemicon-empty"
-local SLOT_TEXTURE        = "Interface\\Buttons\\UI-Quickslot2"
+local DEFAULT_MARKER_INSET = 7
+local EMPTY_ATLAS = "auctionhouse-itemicon-empty"
+local SLOT_TEXTURE = "Interface\\Buttons\\UI-Quickslot2"
+local OWNED_CHECK_GREEN = { 0.4, 1.0, 0.4 }
 
--- C_Texture.GetAtlasInfo returns nil for atlases that don't exist on
--- the current client. We use it before SetAtlas so a marker spec with
--- an atlas + texture pair gracefully falls back when the atlas is
--- missing (older client, Classic, etc.).
 local function AtlasExists(name)
     if not name then return false end
     if not C_Texture or not C_Texture.GetAtlasInfo then return false end
@@ -44,79 +16,34 @@ local function AtlasExists(name)
 end
 
 local CORNER_LAYOUT = {
-    topleft     = { point = "TOPLEFT",     dx = -1, dy =  1 },
-    topright    = { point = "TOPRIGHT",    dx =  1, dy =  1 },
-    bottomleft  = { point = "BOTTOMLEFT",  dx = -1, dy = -1 },
-    bottomright = { point = "BOTTOMRIGHT", dx =  1, dy = -1 },
+    topleft = { point = "TOPLEFT", dx = -1, dy = 1 },
+    topright = { point = "TOPRIGHT", dx = 1, dy = 1 },
+    bottomleft = { point = "BOTTOMLEFT", dx = -1, dy = -1 },
+    bottomright = { point = "BOTTOMRIGHT", dx = 1, dy = -1 },
 }
 
--- ns.SlotIconMarkers: preset registry. Each section that needs a marker
--- adds its preset here so other sections render the same marker the
--- same way. corner picks one of the four CORNER_LAYOUT keys; spec is
--- the texture/atlas + sizing handed to SetMarker. Keep TOPLEFT for
--- primary recommendation (BiS, Must-have), TOPRIGHT for ownership/
--- state, and the bottom row for secondary signals (catalyst, warning,
--- etc.).
---
--- Each spec supports both `atlas` and `texture` — atlas is preferred
--- (modern polished aesthetic, matches KL's custom tier ribbons) and
--- falls back to the texture when the atlas isn't present on the
--- client.
 ns.SlotIconMarkers = {
-    bis = {
-        -- u.gg "W" mark — Crafting BiS designations originate on
-        -- u.gg (u.gg surfaces them via a BadgeLabel that links
-        -- to the u.gg BiS guide; see parse-ugg-crafts.ts:113).
-        -- Same ugg.tga asset reused across the addon for any
-        -- u.gg-sourced attribution.
-        --
-        -- All three source-attribution markers (bis, popular_ugg,
-        -- popular_ugg) live at top-left. BiS stays anchored to the
-        -- corner; PaintCardIcon shifts the popular mark DOWN when both
-        -- are shown so they stack vertically (bis on top) at the same
-        -- corner without overlap.
-        corner = "topleft",
-        spec = {
-            texture = "Interface\\AddOns\\ClassCodex\\Textures\\ugg",
-            size = 13,
-        },
-    },
-    popular_ugg = {
-        -- "Most-played" marker attributed to u.gg — used in PvE
-        -- contexts (raid + Mythic+) where the popularity signal comes
-        -- from u.gg's top-player gear page.
-        corner = "topleft",
-        spec = {
-            texture = "Interface\\AddOns\\ClassCodex\\Textures\\ugg",
-            size = 13,
-        },
-    },
     source_icyveins = {
-        -- Icy Veins attribution mark — used on crafting embellishment cards,
-        -- whose recommendation comes from Icy Veins (u.gg carries no
-        -- embellishment picks). Shares the icyveins.tga brand asset.
+
         corner = "topleft",
         spec = {
-            texture = "Interface\\AddOns\\ClassCodex\\Textures\\icyveins",
+            texture = "Interface\\AddOns\\ClassCodex\\Media\\icyveins",
             size = 13,
         },
     },
     owned = {
         corner = "topright",
         spec = {
-            -- Clean modern checkmark from the common UI atlas (used by
-            -- the friends list, communities, etc.). Falls back to the
-            -- classic CheckBox-Check for older clients.
+
             atlas = "common-icon-checkmark",
             texture = "Interface\\Buttons\\UI-CheckBox-Check",
             size = 16,
+            -- The atlas is green; desaturating it makes the vertex tint work.
+            desaturate = true,
+            vertexColor = { 0.4, 1.0, 0.4 },
         },
     },
 }
-
--------------------------------------------------------------------------------
--- Marker plumbing
--------------------------------------------------------------------------------
 
 local function CreateMarkerTexture(icon, corner, offsetX, offsetY)
     local layout = CORNER_LAYOUT[corner]
@@ -124,7 +51,9 @@ local function CreateMarkerTexture(icon, corner, offsetX, offsetY)
     local tex = icon:CreateTexture(nil, "OVERLAY", nil, 1)
     tex:SetSize(icon._opts.markerSize, icon._opts.markerSize)
     tex:SetPoint(
-        layout.point, icon, layout.point,
+        layout.point,
+        icon,
+        layout.point,
         layout.dx * icon._opts.markerInset + (offsetX or 0),
         layout.dy * icon._opts.markerInset + (offsetY or 0)
     )
@@ -132,22 +61,30 @@ local function CreateMarkerTexture(icon, corner, offsetX, offsetY)
     return tex
 end
 
--- Re-anchor an existing marker texture. Used when callers shift a
--- marker at runtime (e.g. shifting `bis` right when `popular` is also
--- shown so the two sit side-by-side at top-left).
 local function RepositionMarker(icon, tex, corner, offsetX, offsetY)
     local layout = CORNER_LAYOUT[corner]
     if not layout then return end
     tex:ClearAllPoints()
     tex:SetPoint(
-        layout.point, icon, layout.point,
+        layout.point,
+        icon,
+        layout.point,
         layout.dx * icon._opts.markerInset + (offsetX or 0),
         layout.dy * icon._opts.markerInset + (offsetY or 0)
     )
 end
 
-local function ApplySpec(tex, spec)
-    if not spec then tex:Hide(); return end
+-- Green tints pass through the green atlas untouched, which keeps the
+-- owned green vivid; other tints need the desaturated grayscale base.
+local function IsGreenTint(color)
+    return not color or (color[2] >= color[1] and color[2] >= color[3])
+end
+
+local function ApplySpec(tex, spec, vertexColor)
+    if not spec then
+        tex:Hide()
+        return
+    end
     local applied = false
     if AtlasExists(spec.atlas) then
         tex:SetAtlas(spec.atlas)
@@ -156,10 +93,16 @@ local function ApplySpec(tex, spec)
         tex:SetTexture(spec.texture)
         applied = true
     end
-    if not applied then tex:Hide(); return end
+    if not applied then
+        tex:Hide()
+        return
+    end
     if spec.size then tex:SetSize(spec.size, spec.size) end
     tex:SetAlpha(spec.alpha or 1)
-    if spec.vertexColor then
+    tex:SetDesaturated(spec.desaturate and not IsGreenTint(vertexColor or spec.vertexColor) and true or false)
+    if vertexColor then
+        tex:SetVertexColor(vertexColor[1], vertexColor[2], vertexColor[3], vertexColor[4] or 1)
+    elseif spec.vertexColor then
         tex:SetVertexColor(spec.vertexColor[1], spec.vertexColor[2], spec.vertexColor[3], spec.vertexColor[4] or 1)
     else
         tex:SetVertexColor(1, 1, 1, 1)
@@ -167,15 +110,8 @@ local function ApplySpec(tex, spec)
     tex:Show()
 end
 
--------------------------------------------------------------------------------
--- Instance API (mixed into the returned Frame)
--------------------------------------------------------------------------------
-
 local SlotIconAPI = {}
 
--- Resolve an icon texture for itemId via the cached APIs. C_Item path
--- is preferred (no localisation/quality round-trip); GetItemInfo path
--- covers older clients + items still loading from the server.
 local function ResolveIconTexture(itemId)
     if not itemId or itemId == 0 then return nil end
     if C_Item and C_Item.GetItemIconByID then
@@ -194,9 +130,6 @@ function SlotIconAPI:SetItem(itemId)
         self.tex:Show()
         self.empty:Hide()
     else
-        -- Either no itemId or the item hasn't been cached yet. Either
-        -- way, fall back to the auctionhouse-itemicon-empty atlas so the
-        -- frame doesn't render a QuestionMark placeholder for a few ms.
         self.tex:Hide()
         self.empty:Show()
         if itemId and itemId ~= 0 and C_Item and C_Item.RequestLoadItemDataByID then
@@ -205,8 +138,6 @@ function SlotIconAPI:SetItem(itemId)
     end
 end
 
--- Spell-based icon (e.g. Omnium Folio runes). Same slot bevel as items;
--- the texture is the spell's icon.
 function SlotIconAPI:SetSpell(spellId)
     self._spellId = spellId
     local info = spellId and C_Spell and C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(spellId)
@@ -221,11 +152,6 @@ function SlotIconAPI:SetSpell(spellId)
     end
 end
 
--- Markers are keyed by NAME (not corner) so multiple markers can share
--- a corner — e.g. `bis` and `popular` both at top-left, side-by-side.
--- The corner + offset come from the registered preset
--- (ns.SlotIconMarkers[name]) plus any runtime offset set via
--- SetMarkerOffset.
 local function ResolveMarker(icon, name)
     local preset = ns.SlotIconMarkers[name]
     if not preset then return nil end
@@ -237,9 +163,7 @@ function SlotIconAPI:SetMarkerOffset(name, offsetX, offsetY)
     self._markerOffsets[name] = { x = offsetX or 0, y = offsetY or 0 }
     local tex = self.markers[name]
     local preset = ns.SlotIconMarkers[name]
-    if tex and preset then
-        RepositionMarker(self, tex, preset.corner, offsetX, offsetY)
-    end
+    if tex and preset then RepositionMarker(self, tex, preset.corner, offsetX, offsetY) end
 end
 
 function SlotIconAPI:SetMarkerByName(name)
@@ -247,14 +171,10 @@ function SlotIconAPI:SetMarkerByName(name)
     if not preset then return end
     local tex = self.markers[name]
     if not tex then
-        tex = CreateMarkerTexture(
-            self, preset.corner,
-            offset and offset.x or 0,
-            offset and offset.y or 0
-        )
+        tex = CreateMarkerTexture(self, preset.corner, offset and offset.x or 0, offset and offset.y or 0)
         self.markers[name] = tex
     end
-    ApplySpec(tex, preset.spec)
+    ApplySpec(tex, preset.spec, self._markerColors[name])
 end
 
 function SlotIconAPI:ClearMarkerByName(name)
@@ -262,38 +182,36 @@ function SlotIconAPI:ClearMarkerByName(name)
     if tex then tex:Hide() end
 end
 
-function SlotIconAPI:ClearAllMarkers()
-    for _, tex in pairs(self.markers) do tex:Hide() end
+function SlotIconAPI:SetMarkerColor(name, color)
+    self._markerColors[name] = color
+    local tex = self.markers[name]
+    local preset = ns.SlotIconMarkers[name]
+    if tex and preset then ApplySpec(tex, preset.spec, color) end
 end
 
--- Toggle a registered marker on/off in one call (typical hot-path use).
+function SlotIconAPI:ClearAllMarkers()
+    for _, tex in pairs(self.markers) do
+        tex:Hide()
+    end
+end
+
 function SlotIconAPI:ToggleMarker(name, shown)
-    if shown then self:SetMarkerByName(name) else self:ClearMarkerByName(name) end
+    if shown then
+        self:SetMarkerByName(name)
+    else
+        self:ClearMarkerByName(name)
+    end
 end
 
 function SlotIconAPI:SetDesaturated(flag)
     self.tex:SetDesaturated(flag and true or false)
 end
 
--------------------------------------------------------------------------------
--- Public factory
--------------------------------------------------------------------------------
-
--- ns.CreateSlotIcon(parent, opts) -> Frame
--- opts (all optional):
---   size         icon edge length (defaults DEFAULT_ICON_SIZE)
---   slotSize     explicit slot frame edge length (defaults size * slotRatio)
---   slotRatio    multiplier vs size when slotSize is not provided
---   iconTrim     TexCoord crop applied to the icon (built-in Blizzard
---                icons have a ~7-8% margin; trimming it lets the icon
---                sit flush inside the slot bevel)
---   markerSize   default size for corner markers
---   markerInset  how far outside the icon corner each marker sits
 function ns.CreateSlotIcon(parent, opts)
     opts = opts or {}
-    local size       = opts.size       or DEFAULT_ICON_SIZE
-    local slotSize   = opts.slotSize   or math.floor(size * (opts.slotRatio or DEFAULT_SLOT_RATIO) + 0.5)
-    local iconTrim   = opts.iconTrim   or DEFAULT_ICON_TRIM
+    local size = opts.size or DEFAULT_ICON_SIZE
+    local slotSize = opts.slotSize or math.floor(size * (opts.slotRatio or DEFAULT_SLOT_RATIO) + 0.5)
+    local iconTrim = opts.iconTrim or DEFAULT_ICON_TRIM
     local markerSize = opts.markerSize or DEFAULT_MARKER_SIZE
     local markerInset = opts.markerInset or DEFAULT_MARKER_INSET
 
@@ -307,39 +225,164 @@ function ns.CreateSlotIcon(parent, opts)
     }
     btn.markers = {}
     btn._markerOffsets = {}
+    btn._markerColors = {}
 
-    -- ARTWORK -1: empty-slot placeholder (loading/no-icon fallback).
     local empty = btn:CreateTexture(nil, "ARTWORK", nil, -1)
     empty:SetAtlas(EMPTY_ATLAS)
     empty:SetAllPoints()
     empty:SetAlpha(0.7)
     btn.empty = empty
 
-    -- ARTWORK 0: the item icon itself.
     local tex = btn:CreateTexture(nil, "ARTWORK")
     tex:SetAllPoints()
     tex:SetTexCoord(iconTrim, 1 - iconTrim, iconTrim, 1 - iconTrim)
     btn.tex = tex
 
-    -- ARTWORK 1: chunky Quickslot2 bevel. No TexCoord crop — the full
-    -- texture is what gives the frame its weight.
     local slot = btn:CreateTexture(nil, "ARTWORK", nil, 1)
     slot:SetTexture(SLOT_TEXTURE)
     slot:SetSize(slotSize, slotSize)
     slot:SetPoint("CENTER", btn, "CENTER")
     btn.slot = slot
 
-    for k, v in pairs(SlotIconAPI) do btn[k] = v end
+    for k, v in pairs(SlotIconAPI) do
+        btn[k] = v
+    end
 
     return btn
 end
 
--- The slot frame extends slightly past the icon edges; callers laying
--- out cards need to know the actual visual half-extent so the icon
--- doesn't clip into card edges. half = max(size, slotSize) / 2.
-function ns.SlotIconHalfExtent(opts)
-    opts = opts or {}
-    local size = opts.size or DEFAULT_ICON_SIZE
-    local slot = opts.slotSize or math.floor(size * (opts.slotRatio or DEFAULT_SLOT_RATIO) + 0.5)
-    return math.max(size, slot) / 2
+local TABLE_ICON_SIZE = 16
+local TABLE_SLOT_FRAME = math.floor(TABLE_ICON_SIZE * 1.8125 + 0.5)
+ns.TABLE_ROW_HEIGHT = 20
+
+function ns.MakeTableRow(content)
+    local row = CreateFrame("Frame", nil, content)
+    row:SetHeight(ns.TABLE_ROW_HEIGHT)
+
+    row.icon = ns.CreateSlotIcon(row, { size = TABLE_ICON_SIZE, slotSize = TABLE_SLOT_FRAME })
+    row.icon:SetPoint("LEFT", row, "LEFT", 8, 0)
+
+    local label = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    label:SetPoint("LEFT", row.icon.slot, "RIGHT", 4, 0)
+    label:SetWidth(55)
+    label:SetJustifyH("LEFT")
+    label:SetTextColor(0.6, 0.6, 0.6)
+    row.labelText = label
+
+    local check = row:CreateTexture(nil, "OVERLAY")
+    check:SetSize(14, 14)
+    check:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+    check:SetAtlas("common-icon-checkmark")
+    check:SetVertexColor(unpack(OWNED_CHECK_GREEN))
+    check:Hide()
+    row.checkmark = check
+
+    local source = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    source:SetPoint("RIGHT", check, "LEFT", -4, 0)
+    source:SetJustifyH("RIGHT")
+    source:SetWordWrap(false)
+    source:SetTextColor(0.5, 0.5, 0.52)
+    source:Hide()
+    row.sourceCol = source
+
+    local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    name:SetPoint("LEFT", label, "RIGHT", 4, 0)
+    name:SetPoint("RIGHT", row, "RIGHT", -24, 0)
+    name:SetJustifyH("LEFT")
+    name:SetWordWrap(false)
+    row.itemText = name
+
+    ns.SetupItemTooltip(row)
+    row:Hide()
+    return row
+end
+
+function ns.LayoutTable(content, rows, items, opts)
+    for i = 1, #rows do
+        rows[i]:Hide()
+    end
+    local count = math.min(#items, #rows)
+    if count == 0 then return 0 end
+
+    local showSource = opts and opts.showSource
+    local sourceWidth = (opts and opts.sourceWidth) or 120
+    if showSource then
+        -- The source column stays strictly narrower than the item-name column:
+        -- the icon, label (up to 55px), gaps and checkmark take ~126px, and the
+        -- two columns split the remainder — capping below half of it (with a
+        -- 2px margin) always leaves the name the wider one.
+        local cap = math.floor(((content:GetWidth() or 0) - 128) / 2)
+        if cap > 0 and sourceWidth > cap then sourceWidth = cap end
+    end
+
+    for i = 1, count do
+        local item = items[i]
+        local row = rows[i]
+
+        row.labelText:SetText(item.label or "")
+        local labelLen = #(item.label or "")
+        row.labelText:SetWidth(labelLen <= 2 and 18 or 55)
+        if item.labelColor then
+            row.labelText:SetTextColor(item.labelColor[1], item.labelColor[2], item.labelColor[3])
+        else
+            row.labelText:SetTextColor(0.6, 0.6, 0.6)
+        end
+        local name = (item.itemId or item.spellId)
+                and ns.FormatItem({
+                    itemId = item.itemId,
+                    spellId = item.spellId,
+                    name = item.name,
+                    bonusIDs = item.bonusIDs,
+                })
+            or ""
+        if item.count and item.count > 1 then name = name .. "  |cff808080×" .. item.count .. "|r" end
+        row.itemText:SetText(name)
+
+        row.itemText:ClearAllPoints()
+        row.itemText:SetPoint("LEFT", row.labelText, "RIGHT", 4, 0)
+        if showSource and item.sourceText and item.sourceText ~= "" then
+            row.sourceCol:SetWidth(sourceWidth)
+            row.sourceCol:SetText(item.sourceText)
+            row.sourceCol:Show()
+            row.itemText:SetPoint("RIGHT", row.sourceCol, "LEFT", -4, 0)
+        else
+            row.sourceCol:Hide()
+            row.itemText:SetPoint("RIGHT", row, "RIGHT", -24, 0)
+        end
+
+        if item.spellId then
+            row.icon:SetSpell(item.spellId)
+        elseif item.itemId then
+            row.icon:SetItem(item.itemId)
+        end
+        row.itemId = item.itemId
+        row.spellId = item.spellId
+        row.bonusIDs = item.bonusIDs
+        row.catalystItemId = item.catalystItemId
+        row.ejClassID = item.ejClassID
+        row.ejSpecID = item.ejSpecID
+        row.altItemId = nil
+        row.embItemId = nil
+        row.sourceText = item.sourceText
+        row.popText = item.popText
+
+        row.icon:ToggleMarker("owned", false)
+        local checkDesat
+        if item.tickColor then
+            checkDesat = not IsGreenTint(item.tickColor)
+            row.checkmark:SetVertexColor(item.tickColor[1], item.tickColor[2], item.tickColor[3])
+        else
+            checkDesat = false
+            row.checkmark:SetVertexColor(unpack(OWNED_CHECK_GREEN))
+        end
+        row.checkmark:SetDesaturated(checkDesat)
+        row.checkmark:SetShown((item.isOwned or item.tickColor) and true or false)
+
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -(i - 1) * ns.TABLE_ROW_HEIGHT)
+        row:SetPoint("RIGHT", content, "RIGHT", 0, 0)
+        row:Show()
+    end
+
+    return count * ns.TABLE_ROW_HEIGHT
 end

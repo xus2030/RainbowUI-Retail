@@ -1,18 +1,6 @@
 local _, ns = ...
 
--- Shared gearing helpers — item cache, format/quality lookups, BiS reverse
--- lookups (used by tooltip integration), row icon + tooltip factories, and
--- the PvP shape-conversion wrappers. Consumed by every Sections/* module
--- that renders gear data and by GearingSections.lua's dispatcher.
---
--- Pure utility layer: this file creates no widgets and registers no event
--- handlers other than ITEM_DATA_LOAD_RESULT for cache invalidation.
-
 local L = ns.L
-
--------------------------------------------------------------------------------
--- Constants
--------------------------------------------------------------------------------
 
 local TIER_COLORS = {
     S = { r = 1.00, g = 0.50, b = 0.00 },
@@ -40,31 +28,16 @@ local CONSUMABLE_LABELS = {
     augmentRune = L["consumable.augment_rune"],
 }
 
--- Enhance Shaman has 10 enchant slots (MH + OH weapon enchants, Helm,
--- Shoulders, Bracers, Chest, Belt, Legs, Boots, Ring). Cap at 12 to
--- match Compendium.lua's MAX_ENCHANT_ROWS so neither surface drops rows.
 local MAX_ENCHANT_ROWS = 12
 local MAX_GEM_ROWS = 4
 local MAX_CONSUMABLE_ROWS = 6
 
--------------------------------------------------------------------------------
--- Item Cache
--------------------------------------------------------------------------------
-
-local itemCache = {}
-local pendingItems = {}
+local RequestItemData = ns.RequestItemData
 local gearingDirty = false
-
-local function RequestItemData(itemId)
-    if not itemId or itemId == 0 then return end
-    if itemCache[itemId] or pendingItems[itemId] then return end
-    pendingItems[itemId] = true
-    C_Item.RequestLoadItemDataByID(itemId)
-end
 
 local function GetItemName(itemRef)
     if not itemRef then return "" end
-    -- Spell-based entries (e.g. DK runeforges): resolve via C_Spell
+
     if itemRef.spellId then
         if C_Spell and C_Spell.GetSpellName then
             local name = C_Spell.GetSpellName(itemRef.spellId)
@@ -74,7 +47,7 @@ local function GetItemName(itemRef)
             if name then return name end
         end
     end
-    local cached = itemCache[itemRef.itemId]
+    local cached = ns.GetCachedItem(itemRef.itemId)
     if cached and cached.name then return cached.name end
     if itemRef.name and itemRef.name ~= "" then return itemRef.name end
     if itemRef.spellId then return "Spell " .. itemRef.spellId end
@@ -82,55 +55,57 @@ local function GetItemName(itemRef)
 end
 
 local function GetItemQuality(itemId)
-    local cached = itemCache[itemId]
+    local cached = ns.GetCachedItem(itemId)
     return cached and cached.quality or nil
 end
 
--- FormatItem(itemRef [, name]) -> string
--- Convenience wrapper around ns.FormatItemLabel that pulls the
--- quality from the cache for callers that don't already have it.
--- Pass an explicit name override (e.g. after StripEnchantPrefix)
--- when the displayed text differs from the resolved item name.
+-- Quality must reflect the row's bonus ids: M+ and upgrade-track loot renders
+-- purple from its bonuses while the base item is blue. Ask the client for the
+-- exact combo via a bare item string (same layout BuildItemLink emits); base
+-- quality stays the fallback for combos the client hasn't cached yet — rows
+-- re-render once the item data lands.
+local function GetItemQualityWithBonuses(itemRef)
+    local itemId = itemRef and itemRef.itemId
+    local bonusIDs = itemRef and itemRef.bonusIDs
+    if itemId and bonusIDs and #bonusIDs > 0 then
+        local s = "item:" .. itemId .. "::::::::::::" .. #bonusIDs .. ":" .. table.concat(bonusIDs, ":")
+        return select(3, GetItemInfo(s)) or GetItemQuality(itemId)
+    end
+    return GetItemQuality(itemId)
+end
+
 local function FormatItem(itemRef, nameOverride)
     if not itemRef then return "" end
     local name = nameOverride or GetItemName(itemRef)
-    return ns.FormatItemLabel(name, GetItemQuality(itemRef.itemId))
+    return ns.FormatItemLabel(name, GetItemQualityWithBonuses(itemRef))
 end
 
-local itemEventFrame = CreateFrame("Frame")
-itemEventFrame:RegisterEvent("ITEM_DATA_LOAD_RESULT")
-itemEventFrame:SetScript("OnEvent", function(_, _, itemId, success)
-    if success then
-        pendingItems[itemId] = nil
-        local name, _, quality, _, _, _, _, _, _, icon = GetItemInfo(itemId)
-        if name then
-            itemCache[itemId] = { name = name, quality = quality, icon = icon }
-            if not gearingDirty then
-                gearingDirty = true
-                C_Timer.After(0.1, function()
-                    gearingDirty = false
-                    if ns.panel and ns.panel:IsShown() then
-                        ns:UpdateGearingSections()
-                        ns:LayoutPanel()
-                    end
-                end)
-            end
+ns.OnItemLoaded(function()
+    if gearingDirty then return end
+    gearingDirty = true
+    C_Timer.After(0.1, function()
+        gearingDirty = false
+        if ns.panel and ns.panel:IsShown() then
+            ns:UpdateGearingSections()
+            ns:LayoutPanel()
         end
-    end
+    end)
 end)
 
 local function RequestAllItems(gearData)
     if not gearData then return end
     if gearData.enchants then
         for _, e in ipairs(gearData.enchants) do
-            RequestItemData(e.best.itemId)
-            if e.alternate then RequestItemData(e.alternate.itemId) end
+            if e.best and e.best.itemId then RequestItemData(e.best.itemId) end
+            if e.alternate and e.alternate.itemId then RequestItemData(e.alternate.itemId) end
         end
     end
     if gearData.gems then
         if gearData.gems.primary then RequestItemData(gearData.gems.primary.itemId) end
         if gearData.gems.secondary then
-            for _, g in ipairs(gearData.gems.secondary) do RequestItemData(g.itemId) end
+            for _, g in ipairs(gearData.gems.secondary) do
+                RequestItemData(g.itemId)
+            end
         end
     end
     if gearData.consumables then
@@ -139,86 +114,144 @@ local function RequestAllItems(gearData)
         end
     end
     if gearData.trinkets then
-        for _, t in ipairs(gearData.trinkets) do RequestItemData(t.itemId) end
+        for _, t in ipairs(gearData.trinkets) do
+            RequestItemData(t.itemId)
+        end
     end
-    -- Crafting item prefetch — defer to the Section module so this stays
-    -- in sync with whatever shape Sections/Crafting.lua expects.
+
     local craftClassToken, craftSpec = ns.GetPlayerClassSpec()
     ns.Sections.Crafting.RequestItems(craftClassToken, craftSpec, RequestItemData)
     if gearData.bisGear then
         for _, tab in ipairs(gearData.bisGear) do
-            for _, g in ipairs(tab.slots) do RequestItemData(g.item.itemId) end
+            for _, g in ipairs(tab.slots) do
+                RequestItemData(g.item.itemId)
+                if g.item.catalyst then RequestItemData(g.item.catalyst.itemId) end
+            end
         end
     end
 end
 
--------------------------------------------------------------------------------
--- Gear Data Lookup
--------------------------------------------------------------------------------
-
--- The trinket source is a per-spec preference (default Icy Veins, whose tier
--- rankings are editorial rather than u.gg's popularity). Keyed by the current
--- spec so the panel, Compendium and tooltip tier lookup all agree — mirrors how
--- trinketContext is stored (Sections/Trinkets.lua).
-local function GetTrinketSource()
-    local specKey = ns.GetSpecKey and ns.GetSpecKey()
-    if specKey and ClassCodexCharDB and ClassCodexCharDB.perSpec
-        and ClassCodexCharDB.perSpec[specKey]
-        and ClassCodexCharDB.perSpec[specKey].trinketSource then
-        return ClassCodexCharDB.perSpec[specKey].trinketSource
+-- PvP items carry bonus ids that set their PvP item level. Icy Veins' pages
+-- only mark some items with them, but u.gg's PvP gear lists carry them for
+-- every slot — borrow by item id when the active source's entry lacks them.
+-- (No structural fallback: the per-track bonus lists share no common core, so
+-- an unlisted item's bonuses are genuinely unknown.)
+local pvpBonusByItem
+local function PvpItemBonusIds(itemId)
+    if not itemId then return nil end
+    if pvpBonusByItem == nil then
+        pvpBonusByItem = {}
+        local data = ClassCodexSource and ClassCodexSource.ugg
+        data = data and data.data
+        if type(data) == "table" then
+            for _, specs in pairs(data) do
+                for _, sd in pairs(specs) do
+                    local items = sd.gear and sd.gear.all and sd.gear.all.pvp
+                    if type(items) == "table" then
+                        for _, g in ipairs(items) do
+                            if g.itemId and g.bonusIDs and #g.bonusIDs > 0 and pvpBonusByItem[g.itemId] == nil then
+                                pvpBonusByItem[g.itemId] = g.bonusIDs
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
-    return "icyveins"
+    return pvpBonusByItem[itemId]
 end
+ns.PvpItemBonusIds = PvpItemBonusIds
 
--- trinketSourceOverride: when set (the Compendium passes its session-scoped
--- source), it wins over the per-spec saved pref. The panel and tooltip omit it
--- and use the saved pref.
-local function GetSpecGearData(classToken, specKey, trinketSourceOverride)
-    if not (classToken and specKey) then classToken, specKey = ns.GetClassAndSpec() end
+local function GetSpecGearData(classToken, specKey, trinketSourceOverride, contentOverride)
+    if not (classToken and specKey) then
+        classToken, specKey = ns.GetClassAndSpec()
+    end
     if not classToken or not specKey then return nil end
     local out = {}
-    -- trinkets from the selected source (default Icy Veins), falling back to the
-    -- other source if the chosen one carries none for this spec.
-    local function readTrinkets(src)
-        local sd = ns.SourceSpec and ns.SourceSpec(src, classToken, specKey)
-        return sd and sd.trinkets and sd.trinkets["all"] and sd.trinkets["all"]["all"]
-    end
-    local tsrc = trinketSourceOverride or GetTrinketSource()
-    local tr = readTrinkets(tsrc)
-    if not tr then tr = readTrinkets(tsrc == "icyveins" and "ugg" or "icyveins") end
-    if tr then
-        local list = {}
-        for _, t in ipairs(tr) do list[#list + 1] = { itemId = t.itemId, tier = t.tier, popularity = t.pop } end
-        out.trinkets = list
-    end
-    -- gems from u.gg
-    local usd = ns.SourceSpec and ns.SourceSpec("ugg", classToken, specKey)
-    if usd then
-        local gm = usd.gems and usd.gems["all"] and usd.gems["all"]["all"]
+
+    local content = contentOverride or (ns.Context and ns.Context.contentType())
+    local ctxKey = (content == "pvp") and "pvp" or "all"
+    local source = trinketSourceOverride or (ns.ActiveSource and ns.ActiveSource()) or "icyveins"
+    local sd = ns.SourceSpec and ns.SourceSpec(source, classToken, specKey)
+    -- A spec with no PvP guide on the active source shows the dedicated empty
+    -- screen — no borrowed or PvE data under PvP content.
+    if ctxKey == "pvp" and sd and ns.HasPvpGuide and not ns.HasPvpGuide(source, classToken, specKey) then sd = nil end
+
+    if sd then
+        local tr = sd.trinkets and ns.ResolveCategory(sd.trinkets, "all", ctxKey)
+        if tr then
+            local list = {}
+            for _, t in ipairs(tr) do
+                local bonuses = t.bonusIDs or (ctxKey == "pvp" and PvpItemBonusIds(t.itemId)) or nil
+                list[#list + 1] = { itemId = t.itemId, tier = t.tier or "S", popularity = t.pop, bonusIDs = bonuses }
+            end
+            out.trinkets = list
+        end
+
+        local gm = sd.gems and ns.ResolveCategory(sd.gems, "all", ctxKey)
+        if not gm and ctxKey ~= "all" and sd.gems then gm = ns.ResolveCategory(sd.gems, "all", "all") end
         if gm and gm[1] then
             local secondary = {}
-            for _, id in ipairs(gm[1].secondary or {}) do secondary[#secondary + 1] = { itemId = id } end
+            for _, id in ipairs(gm[1].secondary or {}) do
+                secondary[#secondary + 1] = { itemId = id }
+            end
             out.gems = { primary = gm[1].primary and { itemId = gm[1].primary } or nil, secondary = secondary }
         end
-    end
-    -- consumables from Icy Veins; BiS gear reuses the (already-converted) IV accessor
-    local ivsd = ns.SourceSpec and ns.SourceSpec("icyveins", classToken, specKey)
-    if ivsd then
-        local c = ivsd.consumables and ivsd.consumables["all"] and ivsd.consumables["all"]["all"]
+
+        -- Consumables: PvP content falls back to the source's PvE set, then to
+        -- Icy Veins (u.gg publishes no consumables at all).
+        local c = sd.consumables and ns.ResolveCategory(sd.consumables, "all", ctxKey)
+        if not c and ctxKey ~= "all" and sd.consumables then c = ns.ResolveCategory(sd.consumables, "all", "all") end
+        if not c and source ~= "icyveins" then
+            local ivSd = ns.SourceSpec and ns.SourceSpec("icyveins", classToken, specKey)
+            if ivSd and ivSd.consumables then
+                c = ns.ResolveCategory(ivSd.consumables, "all", ctxKey)
+                    or ns.ResolveCategory(ivSd.consumables, "all", "all")
+            end
+        end
         if c then
-            local function top(l) return l and l[1] and { itemId = l[1] } or nil end
-            out.consumables = { flask = top(c.flask), combatPotion = top(c.potions), food = top(c.food), augmentRune = top(c.augmentRune) }
+            local function top(l)
+                return l and l[1] and { itemId = l[1] } or nil
+            end
+            out.consumables = {
+                flask = top(c.flask),
+                combatPotion = top(c.potions),
+                food = top(c.food),
+                augmentRune = top(c.augmentRune),
+            }
+        end
+
+        -- Resolve enchants for the active content first, then the aggregate set.
+        local ench = sd.enchants and ns.ResolveCategory(sd.enchants, "all", ctxKey)
+        if not ench and ctxKey ~= "all" and sd.enchants then ench = ns.ResolveCategory(sd.enchants, "all", "all") end
+        if ench then
+            local list = {}
+            local function mk(e)
+                if not e then return nil end
+                local mapped = e.spellId
+                    and ClassCodexGameData
+                    and ClassCodexGameData.enchants
+                    and ClassCodexGameData.enchants[e.spellId]
+                -- u.gg's own enchant item wins; the id itself is only a
+                -- SpellItemEnchantment id (PvE) and renders as "Item N" if
+                -- nothing else resolved.
+                return { enchantId = e.id, itemId = e.itemId or mapped or e.id, spellId = e.spellId, pop = e.pop }
+            end
+            for slot, entries in pairs(ench) do
+                if entries[1] then
+                    list[#list + 1] = { slot = slot, best = mk(entries[1]), alternate = mk(entries[2]) }
+                end
+            end
+            if #list > 0 then out.enchants = list end
         end
     end
-    local iv = ns.GetIcyVeinsSpecData and ns:GetIcyVeinsSpecData(classToken, specKey)
-    if iv then out.bisGear = iv.bisGear end
+
+    local bis = ns.GetBisGearData and ns.GetBisGearData(source, classToken, specKey)
+    if bis then out.bisGear = bis.bisGear end
     if not next(out) then return nil end
     return out
 end
 
--- Resolve the (classToken, spec-without-class-prefix) pair the docked
--- panel uses for PvP data lookups via PvPData.lua. The docked surface
--- always reflects the player's current spec.
 local function GetPlayerClassSpec()
     local classToken = select(2, UnitClass("player"))
     local specKey = ns.GetSpecKey()
@@ -227,29 +260,6 @@ local function GetPlayerClassSpec()
     return classToken, spec
 end
 
--- PvP shape conversion lives in Shared/PvPData.lua so the Compendium and
--- the docked panel consume the same builders. Bundled into one table to
--- minimise upvalue pressure on UpdateGearingSections (Lua's 60-upvalue
--- limit was tripping after these helpers were added).
-local PvP = {
-    bis = function()
-        if not ns.BuildPvPBisTabs then return nil end
-        local classToken, spec = GetPlayerClassSpec()
-        return ns.BuildPvPBisTabs(classToken, spec)
-    end,
-    enchants = function()
-        if not ns.BuildPvPEnchantsRows then return nil end
-        local classToken, spec = GetPlayerClassSpec()
-        return ns.BuildPvPEnchantsRows(classToken, spec)
-    end,
-    gems = function()
-        if not ns.BuildPvPGemsRecord then return nil end
-        local classToken, spec = GetPlayerClassSpec()
-        return ns.BuildPvPGemsRecord(classToken, spec)
-    end,
-}
-
--- Expose trinket tier lookup for tooltip integration
 function ns:GetTrinketTier(itemId)
     local gearData = GetSpecGearData()
     if not gearData or not gearData.trinkets then return nil, nil, nil end
@@ -262,31 +272,36 @@ function ns:GetTrinketTier(itemId)
     return nil, nil, nil
 end
 
--- Locale-aware class/spec name resolution for tooltip BiS labels.
--- Class names come from Blizzard's LOCALIZED_CLASS_NAMES_MALE. Spec names are
--- resolved via GetSpecializationInfoForClassID using a local (classToken,
--- specKey) → (classID, specIndex) mapping that mirrors the data file keys.
--- Final fallback is a capitalized data key.
 local SPEC_KEYS_BY_CLASS = {
-    DEATHKNIGHT  = { "blood", "frost", "unholy" },
-    DEMONHUNTER  = { "havoc", "vengeance", "devourer" },
-    DRUID        = { "balance", "feral", "guardian", "restoration" },
-    EVOKER       = { "devastation", "preservation", "augmentation" },
-    HUNTER       = { "beast-mastery", "marksmanship", "survival" },
-    MAGE         = { "arcane", "fire", "frost" },
-    MONK         = { "brewmaster", "mistweaver", "windwalker" },
-    PALADIN      = { "holy", "protection", "retribution" },
-    PRIEST       = { "discipline", "holy", "shadow" },
-    ROGUE        = { "assassination", "outlaw", "subtlety" },
-    SHAMAN       = { "elemental", "enhancement", "restoration" },
-    WARLOCK      = { "affliction", "demonology", "destruction" },
-    WARRIOR      = { "arms", "fury", "protection" },
+    DEATHKNIGHT = { "blood", "frost", "unholy" },
+    DEMONHUNTER = { "havoc", "vengeance", "devourer" },
+    DRUID = { "balance", "feral", "guardian", "restoration" },
+    EVOKER = { "devastation", "preservation", "augmentation" },
+    HUNTER = { "beast-mastery", "marksmanship", "survival" },
+    MAGE = { "arcane", "fire", "frost" },
+    MONK = { "brewmaster", "mistweaver", "windwalker" },
+    PALADIN = { "holy", "protection", "retribution" },
+    PRIEST = { "discipline", "holy", "shadow" },
+    ROGUE = { "assassination", "outlaw", "subtlety" },
+    SHAMAN = { "elemental", "enhancement", "restoration" },
+    WARLOCK = { "affliction", "demonology", "destruction" },
+    WARRIOR = { "arms", "fury", "protection" },
 }
 
 local CLASS_ID_BY_TOKEN = {
-    WARRIOR = 1, PALADIN = 2, HUNTER = 3, ROGUE = 4, PRIEST = 5,
-    DEATHKNIGHT = 6, SHAMAN = 7, MAGE = 8, WARLOCK = 9, MONK = 10,
-    DRUID = 11, DEMONHUNTER = 12, EVOKER = 13,
+    WARRIOR = 1,
+    PALADIN = 2,
+    HUNTER = 3,
+    ROGUE = 4,
+    PRIEST = 5,
+    DEATHKNIGHT = 6,
+    SHAMAN = 7,
+    MAGE = 8,
+    WARLOCK = 9,
+    MONK = 10,
+    DRUID = 11,
+    DEMONHUNTER = 12,
+    EVOKER = 13,
 }
 
 local localizedClassNameCache = {}
@@ -311,33 +326,71 @@ local function GetLocalizedSpecName(classToken, specKey)
     local specIndex
     if keys then
         for i, k in ipairs(keys) do
-            if k == specKey then specIndex = i; break end
+            if k == specKey then
+                specIndex = i
+                break
+            end
         end
     end
     if classID and specIndex and GetSpecializationInfoForClassID then
         local _, name = GetSpecializationInfoForClassID(classID, specIndex)
         if name and name ~= "" then result = name end
     end
-    if not result then
-        result = specKey:sub(1, 1):upper() .. specKey:sub(2)
-    end
+    if not result then result = specKey:sub(1, 1):upper() .. specKey:sub(2) end
     localizedSpecNameCache[cacheKey] = result
     return result
 end
 
 local CLASS_SPEC_COUNT = {}
+
+-- Numeric (classID, specID) for the EJ loot filter, off the addon's
+-- classToken + specKey. Positional lookup assumes the game's spec order
+-- matches our key order — not always true (DH's third spec) — so match by
+-- localized name first (order-independent, like QUI's ej_lootspecs), with
+-- position as fallback. specID nil when nothing resolves; callers then
+-- leave the journal's filter alone.
+function ns.GetSpecIDForKeys(classToken, specKey)
+    local classID = CLASS_ID_BY_TOKEN[classToken]
+    if not classID then return nil, nil end
+    if not (specKey and GetSpecializationInfoForClassID) then return classID, nil end
+
+    local keys = SPEC_KEYS_BY_CLASS[classToken]
+    local wantIndex
+    if keys then
+        for i, k in ipairs(keys) do
+            if k == specKey then
+                wantIndex = i
+                break
+            end
+        end
+    end
+    local wantName = GetLocalizedSpecName(classToken, specKey)
+
+    local numSpecs = (
+        C_SpecializationInfo
+        and C_SpecializationInfo.GetNumSpecializationsForClassID
+        and C_SpecializationInfo.GetNumSpecializationsForClassID(classID)
+    ) or 0
+    if numSpecs > 0 then
+        for i = 1, numSpecs do
+            local id, name = GetSpecializationInfoForClassID(classID, i)
+            if id and name and name == wantName then return classID, id end
+            if id and wantIndex == i then return classID, id end
+        end
+    elseif wantIndex then
+        local id = GetSpecializationInfoForClassID(classID, wantIndex)
+        if id then return classID, id end
+    end
+    return classID, nil
+end
+
 local uggBisLookup = {}
 local icyVeinsBisLookup = {}
 local trinketLookup = {}
 local trinketSourceLookup = {}
--- itemId -> bonusIDs, harvested from every source that carries them (u.gg /
--- Icy Veins BiS slots + trinkets). u.gg's gear pages don't publish bonus IDs,
--- so the u.gg source borrows them here to render the correct item level.
+
 local bonusIdLookup = {}
--- context ("raid" / "dungeon") -> the upgrade-track bonusIDs typical of that
--- content, taken from the first trinket we see in that context. Used as the
--- fallback for u.gg items we can't resolve exactly, so a raid pick still
--- shows a mythic-raid item level rather than its base.
+
 local contextBonusDefault = {}
 
 function ns:GetTrinketSource(itemId)
@@ -352,7 +405,6 @@ function ns:GetContextBonusDefault(context)
     return context and contextBonusDefault[context]
 end
 
--- Iterate every spec that has data in any source (union), once.
 local function eachSourceSpec(fn)
     local src = ClassCodexSource
     if not src then return end
@@ -378,22 +430,51 @@ local function BuildBisLookup()
         CLASS_SPEC_COUNT[classToken] = (CLASS_SPEC_COUNT[classToken] or 0) + 1
         local label = GetLocalizedSpecName(classToken, specKey) .. " " .. GetLocalizedClassName(classToken)
 
-        -- Trinket reverse lookup (u.gg): itemId + popularity tier.
         local usd = ns.SourceSpec and ns.SourceSpec("ugg", classToken, specKey)
+        local ivd = ns.SourceSpec and ns.SourceSpec("icyveins", classToken, specKey)
         local tr = usd and usd.trinkets and usd.trinkets["all"] and usd.trinkets["all"]["all"]
-        if tr then
-            for _, t in ipairs(tr) do
-                local id = t.itemId
+        local ivTr = ivd and ivd.trinkets and ivd.trinkets["all"] and ivd.trinkets["all"]["all"]
+
+        if tr or ivTr then
+            -- itemId -> { ugg = tier, iv = tier }, first-listed tier per source wins
+            local tiers = {}
+            for _, t in ipairs(tr or {}) do
+                tiers[t.itemId] = tiers[t.itemId] or {}
+                if not tiers[t.itemId].ugg then tiers[t.itemId].ugg = t.tier end
+            end
+            for _, t in ipairs(ivTr or {}) do
+                tiers[t.itemId] = tiers[t.itemId] or {}
+                if not tiers[t.itemId].iv then tiers[t.itemId].iv = t.tier end
+            end
+            for id, pair in pairs(tiers) do
                 trinketLookup[id] = trinketLookup[id] or {}
-                trinketLookup[id][#trinketLookup[id] + 1] = { label = label, class = classToken, spec = specKey, tier = t.tier }
+                local list = trinketLookup[id]
+                local existing
+                for _, e in ipairs(list) do
+                    if e.label == label then
+                        existing = e
+                        break
+                    end
+                end
+                if existing then
+                    existing.tier = existing.tier or pair.ugg
+                    existing.ivTier = existing.ivTier or pair.iv
+                else
+                    list[#list + 1] =
+                        { label = label, class = classToken, spec = specKey, tier = pair.ugg, ivTier = pair.iv }
+                end
             end
         end
 
-        -- u.gg BiS reverse lookup: non-trinket gear slots across both content tabs
-        -- (deduped per spec). Trinkets are excluded — they have their own lookup.
         local trinketIds = {}
-        if tr then for _, t in ipairs(tr) do trinketIds[t.itemId] = true end end
-        local uggGear = ns.GetUggGearSpecData and ns:GetUggGearSpecData(classToken, specKey)
+        for _, t in ipairs(tr or {}) do
+            trinketIds[t.itemId] = true
+        end
+        for _, t in ipairs(ivTr or {}) do
+            trinketIds[t.itemId] = true
+        end
+
+        local uggGear = ns.GetBisGearData and ns.GetBisGearData("ugg", classToken, specKey)
         if uggGear and uggGear.bisGear then
             local addedForSpec = {}
             for _, tab in ipairs(uggGear.bisGear) do
@@ -409,33 +490,45 @@ local function BuildBisLookup()
             end
         end
 
-        -- Icy Veins BiS reverse lookup (all tabs) + bonus IDs for item-level rendering.
-        local ivGear = ns.GetIcyVeinsSpecData and ns:GetIcyVeinsSpecData(classToken, specKey)
+        local ivGear = ns.GetBisGearData and ns.GetBisGearData("icyveins", classToken, specKey)
         if ivGear and ivGear.bisGear then
             for _, tab in ipairs(ivGear.bisGear) do
                 for _, entry in ipairs(tab.slots) do
                     local id = entry.item.itemId
                     if entry.item.bonusIDs and not bonusIdLookup[id] then bonusIdLookup[id] = entry.item.bonusIDs end
+                    if
+                        id
+                        and entry.source
+                        and entry.source ~= ""
+                        and not trinketSourceLookup[id]
+                        and entry.slot
+                        and entry.slot:lower():find("trinket")
+                    then
+                        trinketSourceLookup[id] = entry.source
+                    end
                     icyVeinsBisLookup[id] = icyVeinsBisLookup[id] or {}
                     local found = false
                     for _, existing in ipairs(icyVeinsBisLookup[id]) do
-                        if existing.label == label then existing.tabs[#existing.tabs + 1] = tab.label; found = true; break end
+                        if existing.label == label then
+                            existing.tabs[#existing.tabs + 1] = tab.label
+                            found = true
+                            break
+                        end
                     end
                     if not found then
-                        icyVeinsBisLookup[id][#icyVeinsBisLookup[id] + 1] = { label = label, class = classToken, spec = specKey, tabs = { tab.label } }
+                        icyVeinsBisLookup[id][#icyVeinsBisLookup[id] + 1] =
+                            { label = label, class = classToken, spec = specKey, tabs = { tab.label } }
                     end
                 end
             end
         end
     end)
-    -- trinketSourceLookup / contextBonusDefault stay empty: u.gg trinkets carry no
-    -- source or bonusIDs (they were nil on the legacy path too).
 end
--- Called at end of file, once the accessors it uses (GetUggGearSpecData /
--- GetIcyVeinsSpecData) are defined.
 
--- Consolidate entries: if all specs of a class share the same entry, show
--- just the class name.
+local function TiersEqual(a, b)
+    return (a.tier or false) == (b.tier or false) and (a.ivTier or false) == (b.ivTier or false)
+end
+
 local function ConsolidateByClass(entries)
     local byClass = {}
     local classOrder = {}
@@ -455,11 +548,20 @@ local function ConsolidateByClass(entries)
         local sameTier = true
         if #classEntries > 1 then
             for i = 2, #classEntries do
-                if classEntries[i].tier ~= classEntries[1].tier then sameTier = false; break end
+                if not TiersEqual(classEntries[i], classEntries[1]) then
+                    sameTier = false
+                    break
+                end
             end
         end
         if #classEntries >= totalSpecs and totalSpecs > 0 and sameTier then
-            result[#result + 1] = { label = className, class = classToken, tier = classEntries[1].tier, consolidated = true }
+            result[#result + 1] = {
+                label = className,
+                class = classToken,
+                tier = classEntries[1].tier,
+                ivTier = classEntries[1].ivTier,
+                consolidated = true,
+            }
         else
             for _, e in ipairs(classEntries) do
                 e.consolidated = false
@@ -482,64 +584,65 @@ function ns:GetIcyVeinsBisSpecs(itemId)
     return ConsolidateByClass(raw)
 end
 
-local IV_GEAR_TAB = { all = "Overall", raid = "Raid", mplus = "Mythic+" }
-function ns:GetIcyVeinsSpecData(classToken, specKey)
+local SLOT_ORDER = {
+    ["Head"] = 1,
+    ["Neck"] = 2,
+    ["Shoulders"] = 3,
+    ["Back"] = 4,
+    ["Chest"] = 5,
+    ["Wrist"] = 6,
+    ["Hands"] = 7,
+    ["Waist"] = 8,
+    ["Legs"] = 9,
+    ["Feet"] = 10,
+    ["Finger 1"] = 11,
+    ["Finger 2"] = 12,
+    ["Trinket 1"] = 13,
+    ["Trinket 2"] = 14,
+    ["Main Hand"] = 15,
+    ["Off Hand"] = 16,
+}
+
+function ns.SortSlotsCanonical(slots)
+    if not slots then return slots end
+    table.sort(slots, function(a, b)
+        return (SLOT_ORDER[a.slot] or 99) < (SLOT_ORDER[b.slot] or 99)
+    end)
+    return slots
+end
+
+local BIS_GEAR_TAB = { all = "Overall", mplus = "Mythic+", raid = "Raid", pvp = "PvP" }
+local BIS_CTX_ORDER = { "all", "mplus", "raid", "pvp" }
+
+function ns.GetBisGearData(source, classToken, specKey)
     if not classToken or not specKey then return nil end
-    local sd = ns.SourceSpec and ns.SourceSpec("icyveins", classToken, specKey)
-    local gearByHero = sd and sd.gear and sd.gear["all"] -- IV is hero-agnostic
-    if not gearByHero then return nil end
-    -- Direct per-context access (not the fallback resolver) so a missing Raid/M+
-    -- tab doesn't inherit the Overall gear.
+    local sd = ns.SourceSpec and ns.SourceSpec(source, classToken, specKey)
+    if not sd or not sd.gear then return nil end
     local bisGear = {}
-    for _, ctx in ipairs({ "all", "raid", "mplus" }) do
-        local slots = gearByHero[ctx]
+    for _, ctx in ipairs(BIS_CTX_ORDER) do
+        local slots = ns.ResolveCategory(sd.gear, "all", ctx)
         if slots then
             local out = {}
             for _, g in ipairs(slots) do
-                out[#out + 1] = { slot = g.slot, item = { itemId = g.itemId, bonusIDs = g.bonusIDs }, source = g.source }
+                local item = { itemId = g.itemId }
+                if g.bonusIDs then
+                    item.bonusIDs = g.bonusIDs
+                elseif ctx == "pvp" then
+                    item.bonusIDs = PvpItemBonusIds(g.itemId)
+                end
+                if g.catalyst then item.catalyst = g.catalyst end
+                local row = { slot = g.slot, item = item }
+                if g.source then row.source = g.source end
+                if g.pop then row.pop = g.pop end
+                out[#out + 1] = row
             end
-            bisGear[#bisGear + 1] = { label = IV_GEAR_TAB[ctx], slots = out }
+            bisGear[#bisGear + 1] = { label = BIS_GEAR_TAB[ctx] or ctx, slots = ns.SortSlotsCanonical(out) }
         end
     end
     if #bisGear == 0 then return nil end
     return { bisGear = bisGear }
 end
 
-function ns:GetUggGearSpecData(classToken, specKey)
-    if not classToken or not specKey then return nil end
-    -- Read the normalized structure via the seam and shape it into the
-    -- { bisGear = { {label, slots={{slot, item={itemId}}}} }, enchants = { {slot, best} } }
-    -- the UI expects.
-    local sd = ns.SourceSpec and ns.SourceSpec("ugg", classToken, specKey)
-    if not sd then return nil end
-    local bisGear = {}
-    for _, ctx in ipairs({ "mplus", "raid" }) do
-        local slots = ns.ResolveCategory(sd.gear, "all", ctx)
-        if slots then
-            local out = {}
-            for _, g in ipairs(slots) do out[#out + 1] = { slot = g.slot, item = { itemId = g.itemId } } end
-            bisGear[#bisGear + 1] = { label = (ctx == "mplus") and "Mythic+" or "Raid", slots = out }
-        end
-    end
-    local enchants = {}
-    local ench = ns.ResolveCategory(sd.enchants, "all", "all")
-    if ench then
-        for slot, list in pairs(ench) do
-            local e = list[1]
-            if e then
-                local name = e.spellId and C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(e.spellId) or nil
-                enchants[#enchants + 1] = { slot = slot, best = { enchantId = e.id, spellId = e.spellId, name = name } }
-            end
-        end
-    end
-    if #bisGear == 0 and #enchants == 0 then return nil end
-    return { bisGear = bisGear, enchants = enchants }
-end
-
--- u.gg's Gear Overview lists items in slot order but never names the slot,
--- so we recover a display label from each item's equip location. English
--- labels keep it consistent with the u.gg / Icy Veins sources, whose slot
--- strings are also raw English from their guides.
 local EQUIPLOC_SLOT = {
     INVTYPE_HEAD = "Head",
     INVTYPE_NECK = "Neck",
@@ -570,24 +673,43 @@ function ns.GearSlotName(itemId)
     return (equipLoc and EQUIPLOC_SLOT[equipLoc]) or ""
 end
 
-local IV_TALENT_CTX = { raid = "Raid", mplus = "Mythic+", delve = "Delves", leveling = "Leveling", all = "General" }
+local IV_TALENT_CTX =
+    { raid = "Raid", mplus = "Mythic+", delve = "Delves", leveling = "Leveling", pvp = "PvP", all = "General" }
 function ns:GetIcyVeinsTalentSpecData(classToken, specKey)
     if not classToken or not specKey then return nil end
     local sd = ns.SourceSpec and ns.SourceSpec("icyveins", classToken, specKey)
-    local byContext = sd and sd.talents and sd.talents["all"] -- IV is hero-agnostic
-    if not byContext then return nil end
-    -- Fixed context order so talents[1] is a sensible default (single-target first).
+    local byHero = sd and sd.talents
+    if not byHero then return nil end
+
+    local heroNames = ClassCodexSource
+        and ClassCodexSource.icyveins
+        and ClassCodexSource.icyveins.reference
+        and ClassCodexSource.icyveins.reference.heroNames
     local talents = {}
-    for _, ctx in ipairs({ "raid", "mplus", "delve", "all", "leveling" }) do
-        local builds = byContext[ctx]
-        if builds then
-            for _, b in ipairs(builds) do
-                talents[#talents + 1] = {
-                    buildLabel = b.label,
-                    exportString = b.export,
-                    context = IV_TALENT_CTX[ctx] or ctx,
-                    leveling = (ctx == "leveling") or nil,
-                }
+    -- The same build fans out to several contexts in the source data (a
+    -- "Raid-Cleave" tree is both raid and mplus); flat lists (dock, pane) show
+    -- one entry per distinct loadout, so skip re-listing an identical export.
+    local seenExports = {}
+    for heroKey, byContext in pairs(byHero) do
+        local heroDisplay = (heroKey ~= "all") and ((heroNames and heroNames[heroKey]) or heroKey) or nil
+        for _, ctx in ipairs({ "raid", "mplus", "delve", "all", "leveling", "pvp" }) do
+            local builds = byContext[ctx]
+            if builds then
+                for _, b in ipairs(builds) do
+                    if b.export and not seenExports[b.export] then
+                        seenExports[b.export] = true
+                        talents[#talents + 1] = {
+                            buildLabel = b.label,
+                            exportString = b.export,
+                            context = IV_TALENT_CTX[ctx] or ctx,
+                            leveling = (ctx == "leveling") or nil,
+                            heroTalent = heroDisplay,
+                            recommended = b.recommended,
+                            tags = b.tags,
+                            honor = b.honor,
+                        }
+                    end
+                end
             end
         end
     end
@@ -601,14 +723,10 @@ function ns:GetTrinketSpecs(itemId)
     return ConsolidateByClass(raw)
 end
 
--------------------------------------------------------------------------------
--- Item Icon Helper
--------------------------------------------------------------------------------
-
 local ICON_SIZE = 16
 
 local function GetItemIcon(itemId)
-    local cached = itemCache[itemId]
+    local cached = ns.GetCachedItem(itemId)
     if cached and cached.icon then return cached.icon end
     local _, _, _, _, _, _, _, _, _, icon = GetItemInfo(itemId)
     return icon
@@ -643,10 +761,6 @@ local function SetRowIcon(row, itemId, spellId)
     end
 end
 
--- GetItemCount sees bags + bank + reagent bank + warbank (with the 5th
--- arg) but NOT equipment slots, so we need the IsEquippedItem
--- short-circuit. Returns false when the user has opted out via the
--- "Highlight Owned Gear" setting.
 local function IsItemOwned(itemId)
     if not itemId then return false end
     if ClassCodexDB and ClassCodexDB.highlightOwnedGear == false then return false end
@@ -654,83 +768,408 @@ local function IsItemOwned(itemId)
     return (GetItemCount(itemId, true, false, true, true) or 0) > 0
 end
 
--------------------------------------------------------------------------------
--- Item Tooltip Helper
--------------------------------------------------------------------------------
-
 local function GetItemLink(itemId)
     local _, link = C_Item.GetItemInfo(itemId)
     return link
 end
 
+--- The full hyperlink for an item with its bonus-list ids. GetItemInfo's cached
+--- link is always the BASE version — without the bonuses a BiS pick renders at
+--- its base item level (e.g. 219 instead of the bonus-encoded 344), so chat
+--- links and dressing-room previews must be built from the ids directly.
+---
+--- Field layout mirrors a REAL in-game link: linkLevel (player level) in field
+--- 9, trailing colon. sourceItemId (catalyst rows) appends the item modifier
+--- the engine itself writes for catalyzed items — "1 modifier, type 64, value
+--- = source item id" (captured from a live conversion:
+--- item:271540:…:5:1558:…:1:64:272239:) — which is what makes the tooltip
+--- apply the conversion's retained source stats.
+function ns.BuildItemLink(itemId, bonusIDs, sourceItemId)
+    if not itemId then return nil end
+    if bonusIDs and #bonusIDs > 0 then
+        -- 7 empty fields (enchant, 4 gems, suffix, unique), linkLevel, 3 more
+        -- (spec, modifiers mask, itemContext), then the bonus count.
+        local bare
+        if sourceItemId then
+            bare = format(
+                "item:%d::::::::%d::::%d:%s:1:64:%d:",
+                itemId,
+                UnitLevel("player") or MAX_PLAYER_LEVEL,
+                #bonusIDs,
+                table.concat(bonusIDs, ":"),
+                sourceItemId
+            )
+        else
+            bare = format(
+                "item:%d::::::::%d::::%d:%s:",
+                itemId,
+                UnitLevel("player") or MAX_PLAYER_LEVEL,
+                #bonusIDs,
+                table.concat(bonusIDs, ":")
+            )
+        end
+        -- Prefer the CLIENT's own link for this exact bonus combo: GetItemInfo
+        -- on an item string returns the engine-sanctioned hyperlink (correct
+        -- color placement, whatever field layout this client build validates
+        -- on send). Hand-built links risk "Invalid escape code in chat
+        -- message" rejections inside C_ChatInfo.SendChatMessage, which does
+        -- no Lua-side validation we could satisfy ourselves.
+        local _, link = GetItemInfo(bare)
+        if not link then
+            C_Item.RequestLoadItemDataByID(itemId)
+            _, link = GetItemInfo(bare)
+        end
+        if link then return link end
+        -- Uncached: hand-build as a fallback (color outside the |H…|h pair,
+        -- matching real client links) until the item data arrives.
+        local name, _, quality = GetItemInfo(itemId)
+        if not name then return GetItemLink(itemId) end
+        local color = "|cffffffff"
+        local ok, r, g, b = pcall(GetItemQualityColor, quality or 1)
+        if ok and r then
+            color = format(
+                "|cff%02x%02x%02x",
+                math.floor(r * 255 + 0.5),
+                math.floor(g * 255 + 0.5),
+                math.floor(b * 255 + 0.5)
+            )
+        end
+        return format("%s|H%s|h[%s]|h|r", color, bare, name:gsub("[%[%]]", ""))
+    end
+    return GetItemLink(itemId)
+end
+
 local function HandleItemClick(self)
     if not self.itemId then return end
-    local link = GetItemLink(self.itemId)
-    if not link then return end
+    local link = (ns.BuildItemLink and ns.BuildItemLink(self.itemId, self.bonusIDs, self.catalystItemId))
+        or GetItemLink(self.itemId)
+    if not link then return end -- uncached item; BuildItemLink already requested the load, next click works
     if IsModifiedClick("CHATLINK") then
+        -- Bag behaviour: insert into the open chat box only; never open chat
+        -- on the user's behalf.
         ChatEdit_InsertLink(link)
     elseif IsModifiedClick("DRESSUP") then
         DressUpItemLink(link)
     end
 end
 
+-- Row text can carry markup (atlas icons, color codes) — strip it before it
+-- reaches the AH search box, where it would break the query.
+local function CleanItemText(text)
+    if not text then return nil end
+    text = text:gsub("|T.-|t", ""):gsub("|A.-|a", ""):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+    -- Quality labels render as [Name] — the brackets break AH search queries.
+    text = text:gsub("%[", ""):gsub("%]", "")
+    text = text:gsub("^%s*", ""):gsub("%s*$", "")
+    return text ~= "" and text or nil
+end
+
+local AUCTIONATOR_LIST_NAME = "Class Codex"
+
+-- Append `item:ID` (Auctionator's exact-item search term) to our shopping
+-- list in Auctionator's SavedVariables. No public API exists for list edits,
+-- so this writes the lists table directly. Retail keys lists by name
+-- (AUC_SHOPPING_LISTS) while classic-era builds keep an array
+-- (AUCTIONATOR_SHOPPING_LISTS) — handle both, never mark the list temporary,
+-- and pcall everything so an internals change degrades to a message instead
+-- of an error. Works anywhere; the list runs when the AH is opened.
+local function AddToAuctionatorList(itemId, name)
+    local ok, added = pcall(function()
+        local lists, keyed = _G.AUC_SHOPPING_LISTS, true
+        if type(lists) ~= "table" then
+            lists, keyed = _G.AUCTIONATOR_SHOPPING_LISTS, false
+        end
+        if type(lists) ~= "table" then
+            -- Retail keeps its lists inside the addon's own namespace rather
+            -- than a bare global — last resort: search Auctionator's exports.
+            if type(Auctionator) == "table" then
+                for _, key in ipairs({ "SHOPPING_LISTS", "ShoppingLists" }) do
+                    if type(Auctionator[key]) == "table" then
+                        lists, keyed = Auctionator[key], true
+                        break
+                    end
+                end
+            end
+        end
+        if type(lists) ~= "table" then
+            -- No list has ever been created, so Auctionator never initialized
+            -- its SavedVariable. Create the retail-shaped table ourselves —
+            -- it is the declared SavedVariable name, so it persists.
+            lists, keyed = {}, true
+            _G.AUC_SHOPPING_LISTS = lists
+        end
+
+        local list
+        if keyed then
+            list = lists[AUCTIONATOR_LIST_NAME]
+        else
+            for _, entry in ipairs(lists) do
+                if type(entry) == "table" and entry.name == AUCTIONATOR_LIST_NAME then
+                    list = entry
+                    break
+                end
+            end
+        end
+        if type(list) ~= "table" or type(list.items) ~= "table" then
+            list = { name = AUCTIONATOR_LIST_NAME, items = {} }
+            if keyed then
+                lists[AUCTIONATOR_LIST_NAME] = list
+            else
+                table.insert(lists, list)
+            end
+        end
+        -- Must read as a permanent, saved list — not a throwaway temp one.
+        list.isTemporary = nil
+
+        -- List entries are display strings in Auctionator's list view, so a
+        -- raw `item:ID` term renders unresolved. Store the (cleaned) name —
+        -- it searches correctly and stays readable; fall back to the id term
+        -- only when no name is known.
+        local term = (name and name ~= "" and name) or ("item:" .. itemId)
+        for _, existing in ipairs(list.items) do
+            if existing == term then return true end
+        end
+        list.items[#list.items + 1] = term
+        return true
+    end)
+    if ok and added then
+        print(
+            "|cff00ccffClass Codex:|r "
+                .. (
+                    (L and L["item.menu.ah_listed"])
+                    or ('Added to your Auctionator "%s" shopping list.'):format(AUCTIONATOR_LIST_NAME)
+                )
+        )
+    else
+        print(
+            "|cff00ccffClass Codex:|r "
+                .. ((L and L["item.menu.ah_list_fail"]) or "Could not update the Auctionator shopping list.")
+        )
+    end
+end
+
+-- Right-click menu shared by every row/icon wired through SetupItemTooltip:
+-- shop via Auctionator (when installed, on Enhancements rows), or copy the name.
+local function OpenItemContextMenu(row)
+    local itemId = row.itemId
+    if not itemId then return end
+    if not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+
+    -- Crafted-enchant item names embed a profession-quality atlas in the name
+    -- itself (straight from GetItemInfo), and row text adds brackets/colors —
+    -- both break Auctionator queries, so always clean whatever we use.
+    local name = CleanItemText(select(1, GetItemInfo(itemId)))
+        or CleanItemText(row.itemText and row.itemText.GetText and row.itemText:GetText())
+        or nil
+    MenuUtil.CreateContextMenu(row, function(_, root)
+        root:CreateTitle(name or (L and L["tab.enhancements"]) or "Item")
+        -- Auctionator integration: only makes sense on the Enhancements tab
+        -- (rows are flagged allowAhSearch) and only with Auctionator installed.
+        -- Presence of the addon is enough to show the entry; the action itself
+        -- resolves whichever SavedVariables shape this build uses.
+        if row.allowAhSearch and Auctionator ~= nil then
+            root:CreateButton((L and L["item.menu.search_ah"]) or "Add to Auctionator List", function()
+                AddToAuctionatorList(itemId, name)
+            end)
+        end
+        -- "View in Dungeon Journal": only where the journal can actually show
+        -- the item. Precedence: a boss NAMED by the source text wins (tier
+        -- pieces drop from several bosses — the index would pick an arbitrary
+        -- one); otherwise the season loot index pins the exact boss by the
+        -- droppable item id (catalyst rows carry the SOURCE item precisely
+        -- for that); a dungeon-only source text is the last resort. Crafted/
+        -- vendor/world-drop rows resolve to nothing and never see the entry.
+        if C_AddOns and C_AddOns.LoadAddOn then
+            pcall(C_AddOns.LoadAddOn, "Blizzard_EncounterJournal")
+        else
+            pcall(LoadAddOn, "Blizzard_EncounterJournal")
+        end
+        local journalItemId = row.catalystItemId or itemId
+        local journalInst, journalEnc
+        if EncounterJournal and ToggleEncounterJournal then
+            local textInst, textEnc
+            if ns.GetJournalTarget then
+                textInst, textEnc = ns.GetJournalTarget(row.sourceText)
+            end
+            if textEnc then
+                journalInst, journalEnc = textInst, textEnc
+            elseif ns.GetJournalLootTarget then
+                journalInst, journalEnc = ns.GetJournalLootTarget(journalItemId)
+            end
+            if not journalInst and textInst then journalInst = textInst end
+        end
+        if journalInst and EncounterJournal_OpenJournal then
+            root:CreateButton(L["item.menu.view_journal"], function()
+                if InCombatLockdown() then return end
+                -- Loot filter goes on BEFORE navigating so the encounter's
+                -- first loot paint already uses it; it is re-asserted after,
+                -- because the journal refreshes loot asynchronously
+                -- (EJ_LOOT_DATA_RECIEVED) and the difficulty switch
+                -- re-renders too — either can race a one-shot filter set.
+                -- The set goes through Blizzard's own global wrapper — the
+                -- exact path a dropdown pick takes — and is verified by
+                -- reading EJ_GetLootFilter back: the C function silently
+                -- ignores invalid (classID, specID) pairs, so a mismatch
+                -- prints instead of failing invisibly.
+                local filterReported
+                local function SetEJLootFilter()
+                    if not (row.ejSpecID and row.ejClassID) then return end
+                    if EncounterJournal and EncounterJournal_SetClassAndSpecFilter then
+                        pcall(EncounterJournal_SetClassAndSpecFilter, EncounterJournal, row.ejClassID, row.ejSpecID)
+                    elseif EJ_SetLootFilter then
+                        pcall(EJ_SetLootFilter, row.ejClassID, row.ejSpecID)
+                        if EncounterJournal_LootUpdate then pcall(EncounterJournal_LootUpdate) end
+                    else
+                        return
+                    end
+                    if not filterReported and EJ_GetLootFilter then
+                        local c, s = EJ_GetLootFilter()
+                        if c ~= row.ejClassID or s ~= row.ejSpecID then
+                            filterReported = true
+                            print(
+                                ("|cffff3333Class Codex:|r journal loot filter not applied (got %s/%s, wanted %s/%s)"):format(
+                                    tostring(c),
+                                    tostring(s),
+                                    tostring(row.ejClassID),
+                                    tostring(row.ejSpecID)
+                                )
+                            )
+                        end
+                    end
+                end
+                SetEJLootFilter()
+                if not EncounterJournal:IsShown() then ShowUIPanel(EncounterJournal) end
+                -- OpenJournal lands on the right content tab and the
+                -- encounter, and its itemID argument selects the Loot side
+                -- tab — but only with an encounter displayed (without one the
+                -- click would hit a stale loot tab), so the item id rides
+                -- along only when the boss is pinned.
+                local okNav = pcall(
+                    EncounterJournal_OpenJournal,
+                    nil,
+                    journalInst,
+                    journalEnc,
+                    nil,
+                    nil,
+                    journalEnc and journalItemId or nil
+                )
+                local function AssertEJState()
+                    SetEJLootFilter()
+                    -- Mythic loot view, matching what the guides cover;
+                    -- validity-checked against the displayed instance —
+                    -- legacy-pool dungeons don't all offer every difficulty.
+                    if
+                        not (DifficultyUtil and DifficultyUtil.ID and EJ_SetDifficulty and EJ_IsValidInstanceDifficulty)
+                    then
+                        return
+                    end
+                    local mythic = DifficultyUtil.ID.DungeonMythic
+                    if not EJ_IsValidInstanceDifficulty(mythic) then mythic = DifficultyUtil.ID.PrimaryRaidMythic end
+                    if EJ_IsValidInstanceDifficulty(mythic) then EJ_SetDifficulty(mythic) end
+                end
+                AssertEJState()
+                C_Timer.After(0.25, AssertEJState)
+                if not okNav and row.ejSpecID and EJ_SetLootFilter then
+                    -- Navigation failed (pcall'd): at least leave the filter on
+                    -- the browsed spec so the journal is in the right context.
+                    pcall(EJ_SetLootFilter, row.ejClassID, row.ejSpecID)
+                end
+            end)
+        end
+        root:CreateButton((L and L["item.menu.link_chat"]) or "Link in chat", function()
+            local link = (ns.BuildItemLink and ns.BuildItemLink(itemId, row.bonusIDs, row.catalystItemId))
+                or GetItemLink(itemId)
+            if link then
+                if not ChatEdit_InsertLink(link) then ChatFrame_OpenChat(link) end
+            end
+        end)
+        root:CreateButton((L and L["item.menu.copy_name"]) or "Copy name", function()
+            local text = name or tostring(itemId)
+            if ns.ShowCopyPopup then ns.ShowCopyPopup(text, row) end
+        end)
+    end)
+end
+
 local function SetupItemTooltip(row)
     row:EnableMouse(true)
-    row:SetScript("OnMouseUp", HandleItemClick)
+    -- Menus open on mouse-DOWN: a tooltip sitting under the cursor (edge of the
+    -- panel, overlapping neighbours) can swallow the mouse-up and make
+    -- right-clicks feel flaky. The tooltip itself is made non-interactive so
+    -- it never eats clicks meant for the row beneath it.
+    row:SetScript("OnMouseDown", function(self, button)
+        if button == "RightButton" then OpenItemContextMenu(self) end
+    end)
+    row:SetScript("OnMouseUp", function(self, button)
+        if button ~= "RightButton" then HandleItemClick(self) end
+    end)
     row:SetScript("OnEnter", function(self)
+        ns.Tooltip.MakeClickThrough()
         if self.spellId then
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetSpellByID(self.spellId)
+            if self.sourceText then ns.Tooltip.Blank().Double(SOURCE or "Source", self.sourceText, "muted", "title") end
+            if self.popText then
+                ns.Tooltip.Blank().Double(L["tooltip.popularity"] or "Popularity", self.popText, "muted", "title")
+            end
             GameTooltip:Show()
         elseif self.itemId then
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             if self.bonusIDs and #self.bonusIDs > 0 then
-                local bonusStr = #self.bonusIDs .. ":" .. table.concat(self.bonusIDs, ":")
-                local link = format("item:%d::::::::::::%s", self.itemId, bonusStr)
-                local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, link)
-                if not ok then GameTooltip:SetItemByID(self.itemId) end
+                -- BuildItemLink returns nil while the item is uncached
+                -- (GetItemLink has nothing yet); SetHyperlink(nil) then errors
+                -- later inside the engine's async tooltip handler, beyond the
+                -- pcall. Fall back to SetItemByID, which waits for data cleanly.
+                local link = ns.BuildItemLink(self.itemId, self.bonusIDs, self.catalystItemId)
+                local ok = link and pcall(GameTooltip.SetHyperlink, GameTooltip, link)
+                if not (link and ok) then GameTooltip:SetItemByID(self.itemId) end
             else
                 GameTooltip:SetItemByID(self.itemId)
             end
             if self.altItemId then
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine((L and L["gear.tooltip.alternative"]) or "Alternative:", 0.6, 0.6, 0.6)
+                ns.Tooltip.Blank().Muted((L and L["gear.tooltip.alternative"]) or "Alternative:")
                 local altRef = { itemId = self.altItemId, name = self.altName or "" }
-                GameTooltip:AddLine("  " .. FormatItem(altRef))
+                ns.Tooltip.Intro("  " .. FormatItem(altRef))
             end
             if self.embItemId then
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine((L and L["gear.tooltip.embellishment"]) or "Embellishment:", 0.6, 0.6, 0.6)
+                ns.Tooltip.Blank().Muted((L and L["gear.tooltip.embellishment"]) or "Embellished:")
                 local embRef = { itemId = self.embItemId, name = self.embName or "" }
-                GameTooltip:AddLine("  " .. FormatItem(embRef))
+                ns.Tooltip.Intro("  " .. FormatItem(embRef))
             end
-            if self.sourceText then
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddDoubleLine(SOURCE or "Source", self.sourceText, 0.5, 0.5, 0.5, 1, 0.82, 0)
+            if self.sourceText then ns.Tooltip.Blank().Double(SOURCE or "Source", self.sourceText, "muted", "title") end
+            if self.catalystItemId then
+                ns.Tooltip.Double(
+                    L["gear.tooltip.catalyst"],
+                    FormatItem({ itemId = self.catalystItemId, bonusIDs = self.bonusIDs }),
+                    "muted",
+                    "title"
+                )
             end
+            if self.popText then
+                ns.Tooltip.Blank().Double(L["tooltip.popularity"] or "Popularity", self.popText, "muted", "title")
+            end
+            ns.Tooltip.Blank().Body(L["item.tooltip.menu_hint"])
             GameTooltip:Show()
         end
     end)
-    row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    row:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
 end
 
--------------------------------------------------------------------------------
--- Export everything Sections/* and the panel dispatcher need on `ns`.
--------------------------------------------------------------------------------
 ns.FormatItem = FormatItem
+ns.CleanItemText = CleanItemText
 ns.IsItemOwned = IsItemOwned
 ns.CreateRowIcon = CreateRowIcon
 ns.SetRowIcon = SetRowIcon
 ns.GetSpellIcon = GetSpellIcon
 ns.SetupItemTooltip = SetupItemTooltip
+ns.OpenItemContextMenu = OpenItemContextMenu
 ns.GetItemIcon = GetItemIcon
 ns.GetItemName = GetItemName
 ns.HandleItemClick = HandleItemClick
-ns.RequestItemData = RequestItemData
 ns.RequestAllItems = RequestAllItems
 ns.GetSpecGearData = GetSpecGearData
 ns.GetPlayerClassSpec = GetPlayerClassSpec
-ns.GearingPvP = PvP
 ns.TIER_COLORS = TIER_COLORS
 ns.TIER_ORDER = TIER_ORDER
 ns.CONTEXT_LABELS = CONTEXT_LABELS
@@ -738,20 +1177,249 @@ ns.CONSUMABLE_ORDER = CONSUMABLE_ORDER
 ns.CONSUMABLE_LABELS = CONSUMABLE_LABELS
 ns.ICON_SIZE_GEAR = ICON_SIZE
 
--- Right-aligned source/drop column: grow to fit its text (up to `cap`) but never
--- so wide that the name column to its left drops below `nameMin`. On a wide pane
--- the full source shows; on a narrow one it caps and ellipsizes as before.
--- `leftCols` = width consumed left of the name (slot/tier + icon + gaps + pad).
 function ns.SizeSourceColumn(fs, rowWidth, leftCols, nameMin, cap)
     local content = math.ceil(fs:GetStringWidth()) + 2
-    local maxByName = (rowWidth and rowWidth > 0)
-        and math.max(20, rowWidth - leftCols - nameMin)
-        or content
+    local maxByName = (rowWidth and rowWidth > 0) and math.max(20, rowWidth - leftCols - nameMin) or content
     fs:SetWidth(math.max(1, math.min(content, maxByName, cap or 300)))
 end
 ns.MAX_ENCHANT_ROWS = MAX_ENCHANT_ROWS
 ns.MAX_GEM_ROWS = MAX_GEM_ROWS
 ns.MAX_CONSUMABLE_ROWS = MAX_CONSUMABLE_ROWS
 
--- Build the item -> specs reverse lookups now that the source accessors above exist.
+local SLOT_TO_INV = {
+    Head = 1,
+    Neck = 2,
+    Shoulders = 3,
+    Back = 15,
+    Chest = 5,
+    Wrist = 9,
+    Hands = 10,
+    Waist = 6,
+    Legs = 7,
+    Feet = 8,
+    ["Finger 1"] = 11,
+    ["Finger 2"] = 12,
+    ["Trinket 1"] = 13,
+    ["Trinket 2"] = 14,
+    ["Main Hand"] = 16,
+    ["Off Hand"] = 17,
+}
+
+local function parseLinkFields(link)
+    if not link then return nil end
+    local payload = link:match("item:([^|]+)")
+    if not payload then return nil end
+    local fields = {}
+    for f in (payload .. ":"):gmatch("([^:]*):") do
+        fields[#fields + 1] = f
+    end
+    return fields
+end
+
+function ns.EquippedEnchantIdForSlot(slot)
+    local invSlot = SLOT_TO_INV[slot]
+    if not invSlot then return nil end
+    local link = GetInventoryItemLink("player", invSlot)
+    local fields = parseLinkFields(link)
+    if not fields then return nil end
+    local id = tonumber(fields[2])
+    return (id and id > 0) and id or nil
+end
+
+function ns.IsGemSocketed(itemId)
+    if not itemId then return false end
+    for _, invSlot in ipairs({ 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17 }) do
+        local link = GetInventoryItemLink("player", invSlot)
+        local fields = parseLinkFields(link)
+        if fields then
+            for gi = 3, 6 do
+                if tonumber(fields[gi]) == itemId then return true end
+            end
+        end
+    end
+    return false
+end
+
+local enchantSpellToId
+
+function ns.RebuildEnchantSpellLookup()
+    enchantSpellToId = {}
+    for _, source in ipairs({ "ugg" }) do
+        local classToken, specKey = ns.GetClassAndSpec()
+        if classToken and specKey then
+            local sd = ns.SourceSpec and ns.SourceSpec(source, classToken, specKey)
+            local byHero = sd and sd.enchants and sd.enchants["all"]
+            local byCtx = byHero and byHero["all"]
+            if byCtx then
+                for _, list in pairs(byCtx) do
+                    for _, e in ipairs(list) do
+                        if e.spellId and e.id then enchantSpellToId[e.spellId] = e.id end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function ns.ResolveEnchantId(entry)
+    if not entry then return nil end
+    -- The item's application spell mapped through the source data is exact;
+    -- enchantId is only as good as the payload's id convention (a SpellItem
+    -- Enchantment id for PvE, an item id for u.gg PvP v2), so it goes last.
+    if entry.itemId then
+        local spellId
+        if GetItemSpell then
+            local _, s = GetItemSpell(entry.itemId)
+            spellId = s
+        end
+        if spellId and enchantSpellToId and enchantSpellToId[spellId] then return enchantSpellToId[spellId] end
+    end
+    return entry.enchantId
+end
+
+function ns.IsEnchantApplied(entry, slot)
+    local id = ns.ResolveEnchantId(entry)
+    if not id then return false end
+    return ns.EquippedEnchantIdForSlot(slot) == id
+end
+
+-- Upgrade-track ticks. The list pins each pick to an exact bonus set, so
+-- its item level defines "done"; green means an owned copy reaches that
+-- item level, yellow means the owned copy is below it. Equipped wins over
+-- bag and bank copies.
+
+local TRACK_COLORS = {
+    perfect = { 0.4, 1.0, 0.4 },
+    below = { 1.0, 0.93, 0.0 },
+}
+
+-- Fingers and trinkets tick on either slot of the pair.
+local EQUIP_SLOT_GROUPS = {
+    ["Finger 1"] = { 11, 12 },
+    ["Finger 2"] = { 11, 12 },
+    ["Trinket 1"] = { 13, 14 },
+    ["Trinket 2"] = { 13, 14 },
+}
+
+local BagNumSlots = C_Container and C_Container.GetContainerNumSlots or _G.GetContainerNumSlots
+local BagItemLink = C_Container and C_Container.GetContainerItemLink or _G.GetContainerItemLink
+
+-- Player bags, the character bank tabs, and the account (warband) bank
+-- tabs. Missing container ids just report zero slots.
+local STORED_CONTAINERS = {}
+do
+    local ei = Enum.BagIndex
+    local bagsMax = (ei and ei.ReagentBag) or 5
+    for bag = 0, bagsMax do
+        STORED_CONTAINERS[#STORED_CONTAINERS + 1] = { bag, "bags" }
+    end
+    for bag = (ei and ei.CharacterBankTab_1) or 6, (ei and ei.CharacterBankTab_6) or 11 do
+        STORED_CONTAINERS[#STORED_CONTAINERS + 1] = { bag, "bank" }
+    end
+    for bag = (ei and ei.AccountBankTab_1) or 12, (ei and ei.AccountBankTab_5) or 16 do
+        STORED_CONTAINERS[#STORED_CONTAINERS + 1] = { bag, "bank" }
+    end
+    -- Legacy negative container ids; invalid ones just report zero slots.
+    for _, bag in ipairs({ -3, -2, -1 }) do
+        STORED_CONTAINERS[#STORED_CONTAINERS + 1] = { bag, "bank" }
+    end
+end
+
+-- Best copy across bags and bank together, so a maxed bank copy is not
+-- masked by a low bag copy or the other way around. BoA versions of a
+-- pick ship under a different item id, so links also match by the name
+-- embedded in them; the stored variant's data is usually uncached, so
+-- GetItemInfo on its id alone would come up empty.
+local function FindStoredIlvl(itemId, name)
+    if not BagNumSlots or not BagItemLink then return nil end
+    local bestIlvl
+    for _, c in ipairs(STORED_CONTAINERS) do
+        local okSlots, numSlots = pcall(BagNumSlots, c[1])
+        if okSlots and numSlots and numSlots > 0 then
+            for slot = 1, numSlots do
+                local okLink, link = pcall(BagItemLink, c[1], slot)
+                if okLink and link then
+                    local fields = parseLinkFields(link)
+                    local storedId = fields and tonumber(fields[1])
+                    local matched = storedId == itemId
+                    if not matched and name then matched = link:match("|h%[(.-)%]|h") == name end
+                    if matched then
+                        local ilvl = GetDetailedItemLevelInfo(link)
+                        if ilvl and (not bestIlvl or ilvl > bestIlvl) then bestIlvl = ilvl end
+                    end
+                end
+            end
+        end
+    end
+    return bestIlvl
+end
+
+function ns.GearTickForEntry(slot, itemId, bonusIDs, sourceItemId)
+    -- A pick without bonuses pins no version, so there is nothing to tick.
+    if not itemId or not bonusIDs or #bonusIDs == 0 or not GetDetailedItemLevelInfo then return nil end
+    local invSlots = EQUIP_SLOT_GROUPS[slot]
+    if not invSlots then
+        local inv = SLOT_TO_INV[slot]
+        invSlots = inv and { inv } or nil
+    end
+
+    -- Uncached items resolve to a base-item link without the pick's
+    -- bonuses; bail so a later render compares against the real target.
+    local name = GetItemInfo(itemId)
+    if not name then
+        C_Item.RequestLoadItemDataByID(itemId)
+        return nil
+    end
+
+    local function LinkMatches(link, fields)
+        local storedId = fields and tonumber(fields[1])
+        if storedId == itemId then return true end
+        -- BoA versions of a pick use a different id; the name rides the
+        -- link itself, so no cached item data is needed to spot one.
+        if name and link:match("|h%[(.-)%]|h") == name then return true end
+        return false
+    end
+
+    local equippedLink
+    for _, invSlot in ipairs(invSlots or {}) do
+        local link = GetInventoryItemLink("player", invSlot)
+        local fields = link and parseLinkFields(link)
+        if fields and LinkMatches(link, fields) then
+            equippedLink = link
+            break
+        end
+    end
+
+    local targetIlvl = GetDetailedItemLevelInfo(ns.BuildItemLink(itemId, bonusIDs, sourceItemId))
+    if not targetIlvl then return nil end
+
+    local ownedIlvl
+    if equippedLink then ownedIlvl = GetDetailedItemLevelInfo(equippedLink) end
+    local count = GetItemCount(itemId, true) or 0
+    local storedCache = ClassCodexCharDB and ClassCodexCharDB.tickStoredIlvl
+    if count == 0 and storedCache then
+        -- The last copy is gone; drop the remembered stored item level.
+        storedCache[itemId] = nil
+    end
+    if not ownedIlvl and count > 0 then
+        ownedIlvl = FindStoredIlvl(itemId, name)
+        if ownedIlvl and storedCache then
+            -- Bank links are only readable near a banker; remember what the
+            -- scan saw so stored copies keep their tick away from it.
+            storedCache[itemId] = ownedIlvl
+        end
+        if not ownedIlvl and storedCache then ownedIlvl = storedCache[itemId] end
+    end
+    if not ownedIlvl then
+        if count > 0 then
+            -- Owned somewhere unreadable (bank links away from a banker,
+            -- BoA variants under another id): the copy is not confirmed at
+            -- the listed level, so it shows yellow.
+            return TRACK_COLORS.below
+        end
+        return nil
+    end
+    return ownedIlvl >= targetIlvl and TRACK_COLORS.perfect or TRACK_COLORS.below
+end
+
 BuildBisLookup()

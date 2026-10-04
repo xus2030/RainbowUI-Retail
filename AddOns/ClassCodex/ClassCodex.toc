@@ -1,19 +1,84 @@
-## Interface: 120100, 120007
+## Interface: 120100
 ## Title: Class Codex
 ## Notes: Stat priorities, talent builds, rotation guides, and gearing recommendations for your current spec.
 ## Author: jfstn
-## Version: 0.40.14
+## Version: 1.5.4
 ## SavedVariables: ClassCodexDB
 ## SavedVariablesPerCharacter: ClassCodexCharDB
 ## X-Curse-Project-ID: 1480030
 ## X-Wago-ID: rNkynwKa
-## X-Website: https://addons.wago.io/addons/classcodex
-## IconTexture: Interface\AddOns\ClassCodex\icon
+## X-Website: https://www.icy-veins.com/download
+## IconTexture: Interface\AddOns\ClassCodex\Media\icon
 ## AddonCompartmentFunc: ClassCodex_OnAddonCompartmentClick
 ## AddonCompartmentFuncOnEnter: ClassCodex_OnAddonCompartmentEnter
 ## AddonCompartmentFuncOnLeave: ClassCodex_OnAddonCompartmentLeave
 
-## Title-zhTW: |cffFF7373[職業]|r 職業寶典
-## Notes-zhTW: Class Codex |n|n直接在角色面板中提供完整的職業指南，幫助玩家快速掌握角色的最佳配置與操作。|n|n|cffffd200使用方法: |r點小地圖按扭。
-## X-Category-zhTW: 職業
-## DefaultState: disabled
+Libs\embeds.xml
+
+
+Data\db_ugg.lua
+Data\db_icyveins.lua
+Data\db_gamedata.lua
+
+
+Core\Locales.lua
+Locales\enUS.lua
+Locales\koKR.lua
+Locales\zhCN.lua
+Locales\deDE.lua
+Locales\frFR.lua
+Locales\ptBR.lua
+Locales\esES.lua
+Locales\itIT.lua
+Locales\ruRU.lua
+Locales\zhTW.lua
+Shared\SourceData.lua
+Shared\ItemCache.lua
+Shared\Context.lua
+Shared\SourceQuery.lua
+Shared\Sources.lua
+Shared\SelfTest.lua
+Shared\ItemLabel.lua
+Shared\ImportExport.lua
+Shared\TalentEncode.lua
+Shared\ReduceTaint.lua
+Shared\PvPTalents.lua
+Shared\OmniumFolio.lua
+Shared\TalentBuildList.lua
+Shared\TalentNames.lua
+Shared\UggContext.lua
+Shared\SpecData.lua
+Shared\RotationFormat.lua
+Shared\SourceReader.lua
+Shared\GearingUtils.lua
+Shared\StatDR.lua
+Shared\StatTargets.lua
+Shared\DungeonArt.lua
+UI\Tooltip.lua
+UI\SlotIcon.lua
+UI\CollapsibleSection.lua
+UI\PageTitle.lua
+UI\CogGlow.lua
+UI\Card.lua
+UI\AnchorPane.lua
+Sections\init.lua
+Sections\Crafting.lua
+Sections\Trinkets.lua
+Sections\Gear.lua
+Sections\Stats.lua
+Sections\Enhancements.lua
+Sections\Rotation.lua
+Sections\Omnium.lua
+Sections\PvpEmpty.lua
+Sections\Talents.lua
+Core\AboutPage.lua
+Core\SupportersPage.lua
+Core\ClassCodex.lua
+Core\GearingSections.lua
+Core\Compendium.lua
+Core\TalentPaneDropdown.lua
+Core\LoadoutDock.lua
+Core\UnitMenuIntegration.lua
+Core\SettingsAbout.lua
+Core\Settings.lua
+Core\Onboarding.lua

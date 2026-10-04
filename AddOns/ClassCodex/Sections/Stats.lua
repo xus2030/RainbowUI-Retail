@@ -3,22 +3,17 @@ ns.Sections = ns.Sections or {}
 
 local L = ns.L
 
--- Stat Priority section — the ranked list of secondary stats per context.
--- Renders on the Guide tab on both surfaces (the panel's "Stats" side tab
--- shows the live stat-target bars, which are a separate inline section).
---
--- Spec-data resolution (FindMatch / GetStatContextOptions / pvpPriority
--- synthesis) stays with the surface owner so this module doesn't fork the
--- existing helpers. Callers pass the resolved values into Render*.
 local Stats = {}
 ns.Sections.Stats = Stats
 
+local HPAD = ns.PAGE_TITLE_HPAD or 8
+
 local MAX_ROWS = 10
 local DEFAULT_RANK_COLORS = {
-    [1] = { r = 1.00, g = 0.50, b = 0.00 },
-    [2] = { r = 0.64, g = 0.21, b = 0.93 },
-    [3] = { r = 0.00, g = 0.44, b = 0.87 },
-    [4] = { r = 0.12, g = 1.00, b = 0.00 },
+    [1] = { r = 0.64, g = 0.21, b = 0.93 },
+    [2] = { r = 0.00, g = 0.44, b = 0.87 },
+    [3] = { r = 0.12, g = 1.00, b = 0.00 },
+    [4] = { r = 1.00, g = 1.00, b = 1.00 },
     [5] = { r = 0.62, g = 0.62, b = 0.62 },
 }
 
@@ -26,224 +21,1001 @@ local function PickRankColor(i, override)
     return (override and override[i]) or DEFAULT_RANK_COLORS[i] or DEFAULT_RANK_COLORS[5]
 end
 
--------------------------------------------------------------------------------
--- Panel surface
--------------------------------------------------------------------------------
+-- ============================================================
+-- Stat Priority subsection
+-- ============================================================
 
-local panel = {}
+-- Stat-priority variants WITHIN one content view, mirroring the Best in Slot
+-- variant tabs: the section always follows the page's content context (like
+-- BiS does), and the suffix/cog only appear when the source publishes more
+-- than one genuinely different priority for that same content type —
+-- identical orders collapse, so no option is shown when the stats don't
+-- differ. Beyond a genuine content split ("Mythic+", Icy Veins' editorial
+-- M+ sections), sources can publish playstyle-flavored priorities on their
+-- own axis — "single-target" and "aoe" (u.gg's target-count data, Icy Veins'
+-- split pairs) and "damage" (tank Survivability vs Damage Output pairs).
+-- Mythic+ is always the AoE order when the source publishes one (there is no
+-- single-target option there at all); Raid offers Single Target vs AoE.
+-- Variant keys the source doesn't carry fall back to the general order, so
+-- they're only offered when a real entry resolved.
+local CT_VARIANTS = {
+    mplus = {
+        { key = "mplus", label = "Mythic+" },
+        { key = "aoe", label = "AoE" },
+        { key = "damage", label = "Damage" },
+    },
+    raid = {
+        -- No source publishes a raid-specific priority (raid resolves through
+        -- the aggregate), so the raid view offers the playstyle axis directly.
+        { key = "single-target", label = "Single Target" },
+        { key = "aoe", label = "AoE" },
+        { key = "damage", label = "Damage" },
+    },
+    pvp = { { key = "pvp", label = "PvP" } },
+}
 
--- opts.parent (contentFrame), opts.header (function(parent,label) -> header
--- frame; collapsible). The caller hooks the header OnClick separately so the
--- panel can drive its own collapsed-state persistence.
-function Stats.InitPanel(opts)
-    panel.section = CreateFrame("Frame", nil, opts.parent)
-    panel.header = opts.header(panel.section, L["section.stat_priority"])
-    panel.content = CreateFrame("Frame", nil, panel.section)
-    panel.content:SetPoint("TOPLEFT", panel.header, "BOTTOMLEFT", 0, 0)
-    panel.content:SetPoint("RIGHT", 0, 0)
-    panel.content:SetHeight(200)
+local function LoadStatPrefs(specKey)
+    specKey = specKey or (ns.GetSpecKey and ns.GetSpecKey())
+    if specKey and ClassCodexCharDB and ClassCodexCharDB.perSpec and ClassCodexCharDB.perSpec[specKey] then
+        return ClassCodexCharDB.perSpec[specKey].statPriorityTab
+    end
+    return nil
+end
 
-    panel.ctxDropdown = ns.CreateOptionDropdown("ClassCodexStatCtxDropdown", panel.content)
-    panel.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
-    panel.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
-    panel.ctxDropdown:Hide()
+local function SaveStatPrefs(specKey, tabLabel)
+    specKey = specKey or (ns.GetSpecKey and ns.GetSpecKey())
+    if not specKey or not ClassCodexCharDB then return end
+    ClassCodexCharDB.perSpec = ClassCodexCharDB.perSpec or {}
+    ClassCodexCharDB.perSpec[specKey] = ClassCodexCharDB.perSpec[specKey] or {}
+    ClassCodexCharDB.perSpec[specKey].statPriorityTab = tabLabel
+end
 
-    panel.rows = {}
+local function prioritySignature(tiers)
+    local parts = {}
+    for i, tier in ipairs(tiers) do
+        parts[i] = table.concat(tier, "\1")
+    end
+    return table.concat(parts, "\2")
+end
+
+-- The offered variants for one content view, in order, deduplicated by their
+-- actual stat order. Each entry carries the context key its data resolved
+-- through ("mplus", "damage", "all" for the wildcard fallback) so callers can
+-- derive breakpoints from the same priority they display.
+local function computeVariants(classToken, specKey, view, source, heroSlug)
+    local variants, seenSig = {}, {}
+    for i, v in ipairs(CT_VARIANTS[view] or {}) do
+        local p, hitCtx = ns.GetStatPriority(classToken, specKey, v.key, source, heroSlug)
+        -- A non-first variant resolving through the wildcard means the source
+        -- has no entry for it — the lookup fell back to the general order the
+        -- first option already shows, so don't offer it again under a variant
+        -- label.
+        if p and not (i > 1 and hitCtx == "all") then
+            -- The view's own context key resolving through the wildcard means
+            -- the source has no context-specific split: what's shown is the
+            -- general order, and "General" says so.
+            local label = (i == 1 and hitCtx == "all") and "General" or v.label
+            local sig = prioritySignature(p)
+            if not seenSig[sig] then
+                seenSig[sig] = true
+                variants[#variants + 1] = { label = label, priority = p, hitCtx = hitCtx }
+            end
+        end
+    end
+    -- Mythic+ is always the AoE order when the source publishes one: the
+    -- wildcard placeholder (the general/single-target order) drops out rather
+    -- than trailing behind a real AoE entry. Specs with no AoE data keep the
+    -- placeholder — it's the best available order — and tank Defensive/Damage
+    -- pairs are untouched (their axis is survivability, not target count).
+    if view == "mplus" then
+        local hasAoe = false
+        for _, v in ipairs(variants) do
+            if v.hitCtx == "aoe" then
+                hasAoe = true
+                break
+            end
+        end
+        if hasAoe then
+            for i = #variants, 1, -1 do
+                if variants[i].hitCtx == "all" then table.remove(variants, i) end
+            end
+        end
+    end
+    -- Wildcard-fallback placeholders read as the pair they're the default
+    -- side of — the tank orders read Defensive vs Damage, the split pairs
+    -- Single Target vs AoE — rather than "General", wherever the placeholder
+    -- sits (the M+ default swap above can demote it).
+    local placeholderLabel
+    for _, v in ipairs(variants) do
+        if v.label == "Damage" then
+            placeholderLabel = "Defensive"
+        elseif v.label == "AoE" and not placeholderLabel then
+            placeholderLabel = "Single Target"
+        end
+    end
+    if placeholderLabel then
+        for _, v in ipairs(variants) do
+            if v.label == "General" then v.label = placeholderLabel end
+        end
+    end
+    -- A single offered order (e.g. u.gg specs whose single-target and AoE
+    -- orders are identical) carries no label — there is nothing to choose,
+    -- so nothing may ever surface one.
+    if #variants == 1 then variants[1].label = nil end
+    return variants
+end
+
+--- The variant-aware stat priority for one content view: the offered variants
+--- for that view with the per-spec saved choice applied. `specKey` is the data
+--- key (raw spec slug); `prefKey` is the per-spec preferences key
+--- ("CLASS-spec") when the caller knows it. Returns the display tiers, the
+--- context key they resolved through, the chosen variant's label (nil when the
+--- view offers no real choice), and the full variant list. Shared by the
+--- pane/compendium sections and the item-tooltip rank badges so both always
+--- follow the same selection.
+function Stats.ResolveViewPriority(classToken, specKey, contentType, source, heroSlug, prefKey)
+    if not (classToken and specKey and ns.GetStatPriority) then return nil end
+    local view = contentType or (ns.Context and ns.Context.contentType()) or "mplus"
+    if type(view) == "string" and view:sub(1, 4) == "pvp:" then view = "pvp" end
+    local variants = computeVariants(classToken, specKey, view, source, heroSlug)
+    if #variants == 0 then return nil, nil, nil, variants end
+    local chosen = variants[1]
+    local label
+    if #variants > 1 then
+        local saved = LoadStatPrefs(prefKey or specKey)
+        for _, v in ipairs(variants) do
+            if v.label == saved then
+                chosen = v
+                break
+            end
+        end
+        label = chosen.label
+    end
+    return chosen.priority, chosen.hitCtx, label, variants
+end
+
+local function resolvePriority(inst, args)
+    if not (args.classToken and args.specKey and ns.GetStatPriority) then
+        inst.variantOptions = nil
+        return args.priorityStats
+    end
+    local priority, _, label, variants = Stats.ResolveViewPriority(
+        args.classToken,
+        args.specKey,
+        args.contentType,
+        args.source,
+        args.heroSlug,
+        args.prefKey
+    )
+    inst.variantOptions = #variants > 1 and variants or nil
+    if #variants == 0 then return nil end
+    if inst.variantOptions then
+        inst.currentVariant = label
+        inst.specKey = args.prefKey or args.specKey
+    else
+        inst.currentVariant = nil
+    end
+    return priority
+end
+
+local function makeCog(inst, refresh)
+    local cog = CreateFrame("Button", nil, inst.header)
+    cog:SetSize(14, 14)
+    cog:RegisterForClicks("LeftButtonUp")
+    local cogIcon = cog:CreateTexture(nil, "ARTWORK")
+    cogIcon:SetAllPoints()
+    cogIcon:SetAtlas("QuestLog-icon-setting")
+    cogIcon:SetVertexColor(0.6, 0.6, 0.6)
+    cog:SetScript("OnEnter", function(self)
+        cogIcon:SetVertexColor(1, 1, 1)
+        local opts = inst.variantOptions
+        local hint = (opts and #opts > 1) and "Click to change variant or tooltip settings."
+            or "Click to change tooltip settings."
+        ns.Tooltip.Open(self, "ANCHOR_RIGHT").Title(L["section.stat_priority"] or "Stat Priority").Hint(hint).Show()
+    end)
+    cog:SetScript("OnLeave", function()
+        cogIcon:SetVertexColor(0.6, 0.6, 0.6)
+        ns.Tooltip.Hide()
+    end)
+    cog:SetScript("OnClick", function(self)
+        if not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+        MenuUtil.CreateContextMenu(self, function(_, root)
+            root:CreateTitle(L["section.stat_priority"] or "Stat Priority")
+            local opts = inst.variantOptions
+            if opts and #opts > 1 then
+                for _, v in ipairs(opts) do
+                    root:CreateRadio(v.label, function()
+                        return inst.currentVariant == v.label
+                    end, function()
+                        SaveStatPrefs(inst.specKey, v.label)
+                        -- The item-tooltip rank badges follow the saved choice.
+                        if ns.InvalidateStatRankCache then ns.InvalidateStatRankCache() end
+                        if refresh then refresh() end
+                        return MenuResponse.Refresh
+                    end)
+                end
+                root:CreateDivider()
+            end
+            local rankCheck = root:CreateCheckbox(L["settings.label.stat_priority_ranks"], function()
+                return ClassCodexDB and ClassCodexDB.showTooltipBadges ~= false
+            end, function()
+                if ClassCodexDB then ClassCodexDB.showTooltipBadges = ClassCodexDB.showTooltipBadges == false end
+                if ns.InvalidateTooltipCache then ns.InvalidateTooltipCache() end
+                return MenuResponse.Refresh
+            end)
+            if rankCheck and rankCheck.SetTooltip then
+                rankCheck:SetTooltip(function(tip)
+                    ns.Tooltip.MenuTip(
+                        tip,
+                        L["settings.label.stat_priority_ranks"] or "Stat priority ranks",
+                        "Item tooltips show each stat's priority rank (#1, #2, …) for your hero talent."
+                    )
+                end)
+            end
+        end)
+    end)
+    cog:Hide()
+    inst.cog = cog
+    inst.cogSetShown = function(shown)
+        cog:SetShown(shown)
+    end
+    if ns.MakeCogGlow then
+        ns.MakeCogGlow(cog, cogIcon)
+        ns.MakeLabelMenuHotspot(inst.header, cog)
+    end
+    return cog
+end
+
+local function placeCog(inst)
+    if not (inst.cog and inst.header and inst.header.AddHeaderWidget) then return end
+    inst.header:AddHeaderWidget(inst.cog)
+end
+
+local function buildPriority(inst, opts, collapsible)
+    inst.section = CreateFrame("Frame", nil, opts.parent)
+    inst.header = (opts.header or opts.headerFactory)(inst.section, L["section.stat_priority"], collapsible)
+    inst.content = CreateFrame("Frame", nil, inst.section)
+    inst.content:SetPoint("TOPLEFT", inst.header, "BOTTOMLEFT", 0, 0)
+    inst.content:SetPoint("RIGHT", 0, 0)
+    inst.content:SetHeight(200)
+
+    inst.ctxDropdown = ns.CreateOptionDropdown(inst.ddName, inst.content)
+    inst.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
+    inst.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
+    inst.ctxDropdown:Hide()
+
+    inst.rows = {}
     for i = 1, MAX_ROWS do
-        local row = CreateFrame("Frame", nil, panel.content)
+        local row = CreateFrame("Frame", nil, inst.content)
         row:SetHeight(20)
         row:SetPoint("TOPLEFT", 0, -(i - 1) * ns.ROW_HEIGHT)
         row:SetPoint("RIGHT", 0, 0)
         local rank = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        rank:SetPoint("LEFT", 0, 0)
-        rank:SetWidth(20)
-        rank:SetJustifyH("CENTER")
+        rank:SetPoint("LEFT", HPAD, 0)
+        rank:SetWidth(16)
+        rank:SetJustifyH("LEFT")
         row.rank = rank
         local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        name:SetPoint("LEFT", rank, "RIGHT", 6, 0)
-        name:SetPoint("RIGHT", 0, 0)
+        name:SetPoint("LEFT", rank, "RIGHT", 4, 0)
+        name:SetPoint("RIGHT", -HPAD, 0)
         name:SetJustifyH("LEFT")
         row.statName = name
-        panel.rows[i] = row
+        inst.rows[i] = row
     end
 
-    return panel.section, panel.header, panel.content
+    inst.pvpFallback = inst.content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    inst.pvpFallback:SetTextColor(0.5, 0.5, 0.5)
+    inst.pvpFallback:Hide()
 end
 
--- args = {
---   contextOptions = { ctxLabel, ... } -- empty array hides the dropdown
---   currentContext = string | nil      -- which option is active
---   priorityStats  = { { "stat", ... }, ... } | nil  -- nil hides the section
---   rankColors     = optional override for tier colours
---   onCtxChange    = function(picked) end -- caller saves + re-renders
--- }
--- Returns the rendered row count for the layout pass.
-function Stats.RenderPanel(args)
+local function renderPriority(inst, args)
     local options = args.contextOptions or {}
     local showCtx = #options > 0
 
     if showCtx then
-        panel.ctxDropdown:Show()
-        panel.ctxDropdown:SetOptions(options, args.currentContext, function(picked)
+        inst.ctxDropdown:Show()
+        inst.ctxDropdown:SetOptions(options, args.currentContext, function(picked)
             if args.onCtxChange then args.onCtxChange(picked) end
         end)
     else
-        panel.ctxDropdown:Hide()
+        inst.ctxDropdown:Hide()
     end
 
-    for i = 1, MAX_ROWS do panel.rows[i]:Hide() end
-    local priority = args.priorityStats
-    if not priority then
-        panel.section:Hide()
-        return 0
+    local priority = resolvePriority(inst, args)
+    local hasVariants = inst.variantOptions and #inst.variantOptions > 1 or false
+    -- Like the Best in Slot cog: always present while the section shows — the
+    -- menu carries the tooltip-ranks setting even when no variant choice exists.
+    if inst.cogSetShown then inst.cogSetShown(true) end
+    if inst.header and inst.header.label then
+        local base = L["section.stat_priority"] or "Stat Priority"
+        if hasVariants and inst.currentVariant and inst.currentVariant ~= "" then
+            inst.header.label:SetText(base .. " " .. ns.DOT_SEPARATOR .. " " .. inst.currentVariant)
+        else
+            inst.header.label:SetText(base)
+        end
     end
 
-    local yOffset = showCtx and -30 or 0
-    local count = math.min(#priority, MAX_ROWS)
-    for i = 1, count do
-        local row = panel.rows[i]
-        local color = PickRankColor(i, args.rankColors)
-        row.rank:SetTextColor(color.r or 0.6, color.g or 0.6, color.b or 0.6)
-        row.rank:SetText(i .. ".")
-        row.statName:SetTextColor(
-            #priority[i] > 1 and 0.8 or 1,
-            #priority[i] > 1 and 0.8 or 1,
-            #priority[i] > 1 and 0.6 or 1
-        )
-        row.statName:SetText(table.concat(priority[i], " / "))
-        row:ClearAllPoints()
-        row:SetPoint("TOPLEFT", 0, yOffset - (i - 1) * ns.ROW_HEIGHT)
-        row:SetPoint("RIGHT", 0, 0)
-        row:Show()
-    end
-    panel.section:Show()
-    return count
-end
-
--- Layout helper for the panel — returns the section's content height
--- (rows + optional 30px dropdown).
-function Stats.GetPanelContentHeight(visibleRowCount)
-    local h = (visibleRowCount or 0) * ns.ROW_HEIGHT
-    if panel.ctxDropdown and panel.ctxDropdown:IsShown() then
-        h = h + 30
-    end
-    return h
-end
-
--------------------------------------------------------------------------------
--- Compendium surface
--------------------------------------------------------------------------------
-
-local comp = {}
-
--- opts.parent (scrollChild), opts.headerFactory (collapsible), opts.refresh
--- (callback the dropdown invokes when ctx changes).
-function Stats.InitCompendium(opts)
-    comp.section = CreateFrame("Frame", nil, opts.parent)
-    comp.header = opts.headerFactory(comp.section, L["section.stat_priority"], true)
-    comp.content = CreateFrame("Frame", nil, comp.section)
-    comp.content:SetPoint("TOPLEFT", comp.header, "BOTTOMLEFT", 0, -2)
-    comp.content:SetPoint("RIGHT", 0, 0)
-
-    comp.ctxDropdown = CreateFrame(
-        "DropdownButton", "ClassCodexCompStatCtxDD",
-        comp.content, "WowStyle1DropdownTemplate"
-    )
-    comp.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
-    comp.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
-    comp.ctxDropdown:SetHeight(24)
-    comp.ctxDropdown:Hide()
-
-    comp.rows = {}
+    inst.pvpFallback:Hide()
     for i = 1, MAX_ROWS do
-        local row = CreateFrame("Frame", nil, comp.content)
-        row:SetHeight(20)
-        local rank = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        rank:SetPoint("LEFT", 0, 0); rank:SetWidth(20); rank:SetJustifyH("CENTER")
-        row.rank = rank
-        local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        name:SetPoint("LEFT", rank, "RIGHT", 6, 0); name:SetPoint("RIGHT", 0, 0)
-        name:SetJustifyH("LEFT")
-        row.statName = name
-        comp.rows[i] = row
+        inst.rows[i]:Hide()
     end
-
-    comp.pvpFallback = comp.content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    comp.pvpFallback:SetTextColor(0.5, 0.5, 0.5)
-    comp.pvpFallback:Hide()
-
-    return comp.section, comp.header, comp.content
-end
-
--- args = {
---   contextOptions     = { ctxKey, ... }
---   currentContext     = string
---   priorityStats      = { { "stat" }, ... } | nil
---   showPvpFallback    = boolean       -- shown when ctx=PvP but no data
---   labelForContext    = function(ctx) -> string (icon-prefixed labels)
---   onCtxChange        = function(picked)
---   rankColors         = optional
--- }
-function Stats.RenderCompendium(args)
-    local options = args.contextOptions or {}
-    local showCtx = #options > 0
-
-    if showCtx then
-        comp.ctxDropdown:SetupMenu(function(_, rootDescription)
-            for _, ctx in ipairs(options) do
-                rootDescription:CreateRadio(
-                    args.labelForContext and args.labelForContext(ctx) or ctx,
-                    function() return args.currentContext == ctx end,
-                    function()
-                        if args.onCtxChange then args.onCtxChange(ctx) end
-                    end,
-                    ctx)
-            end
-        end)
-        comp.ctxDropdown:Show()
-    else
-        comp.ctxDropdown:Hide()
-    end
-
-    comp.pvpFallback:Hide()
-    for i = 1, MAX_ROWS do comp.rows[i]:Hide() end
-
-    local priority = args.priorityStats
     if priority then
         local yOffset = showCtx and -30 or 0
         local count = math.min(#priority, MAX_ROWS)
         for i = 1, count do
-            local row = comp.rows[i]
+            local row = inst.rows[i]
             local color = PickRankColor(i, args.rankColors)
             row.rank:SetTextColor(color.r or 0.6, color.g or 0.6, color.b or 0.6)
             row.rank:SetText(i .. ".")
-            row.statName:SetTextColor(1, 1, 1)
+            row.statName:SetTextColor(
+                #priority[i] > 1 and 0.8 or 1,
+                #priority[i] > 1 and 0.8 or 1,
+                #priority[i] > 1 and 0.6 or 1
+            )
             row.statName:SetText(table.concat(priority[i], " / "))
             row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", comp.content, "TOPLEFT", 0, yOffset - (i - 1) * ns.ROW_HEIGHT)
-            row:SetPoint("RIGHT", comp.content, "RIGHT", 0, 0)
+            row:SetPoint("TOPLEFT", 0, yOffset - (i - 1) * ns.ROW_HEIGHT)
+            row:SetPoint("RIGHT", 0, 0)
             row:Show()
         end
-        comp.content:SetHeight(math.abs(yOffset) + count * ns.ROW_HEIGHT)
-        comp.section:Show()
-    elseif args.showPvpFallback then
+        inst.section:Show()
+        return count
+    elseif args.showPvpFallback or (args.contentType and args.contentType:sub(1, 3) == "pvp") then
         local yOffset = showCtx and -30 or 0
-        comp.pvpFallback:SetText(L["pvp.no_stat_priority"]
-            or "No PvP stat priority for this spec yet.")
-        comp.pvpFallback:ClearAllPoints()
-        comp.pvpFallback:SetPoint("TOPLEFT", comp.content, "TOPLEFT", 4, yOffset - 4)
-        comp.pvpFallback:Show()
-        comp.content:SetHeight(math.abs(yOffset) + 20)
-        comp.section:Show()
+        inst.pvpFallback:SetText(L["pvp.no_stat_priority"] or "No PvP stat priority for this spec yet.")
+        inst.pvpFallback:ClearAllPoints()
+        inst.pvpFallback:SetPoint("TOPLEFT", inst.content, "TOPLEFT", 4, yOffset - 4)
+        inst.pvpFallback:Show()
+        inst.section:Show()
+        return 0
+    else
+        inst.section:Hide()
+        return 0
     end
 end
 
-function Stats.GetCompendiumContentHeight()
+local function priorityHeight(inst)
     local h = 0
-    if comp.ctxDropdown:IsShown() then h = h + 30 end
+    if inst.ctxDropdown:IsShown() then h = h + 30 end
     for i = 1, MAX_ROWS do
-        if comp.rows[i]:IsShown() then h = h + ns.ROW_HEIGHT end
+        if inst.rows[i]:IsShown() then h = h + ns.ROW_HEIGHT end
     end
-    if comp.pvpFallback:IsShown() then h = h + 20 end
+    if inst.pvpFallback:IsShown() then h = h + 20 end
     return h
+end
+
+-- ============================================================
+-- Stat Targets subsection
+-- ============================================================
+
+local TGT_MAX_ROWS = 4
+local TGT_ROW_HEIGHT = 36
+local TGT_ROW_GAP = 5
+local BAR_HEIGHT = 16
+local TARGET_TICK_FRAC = 0.8
+
+local renderTargets
+
+local DISPLAY_ORDER = { "mastery", "haste", "crit", "versatility" }
+
+local STATUS_ICONS = {
+    above = {
+        texture = "Interface\\BUTTONS\\Arrow-Up-Up",
+        r = 0.40,
+        g = 0.70,
+        b = 1.00,
+        texCoord = { 0, 1, 0, 1 },
+    },
+    at = { texture = "Interface\\BUTTONS\\UI-CheckBox-Check", r = 0.40, g = 1.00, b = 0.45, texCoord = { 0, 1, 0, 1 } },
+    below = {
+        texture = "Interface\\BUTTONS\\Arrow-Up-Up",
+        r = 1.00,
+        g = 0.40,
+        b = 0.40,
+        texCoord = { 0, 1, 1, 0 },
+    },
+}
+local BAR_BAND_COLORS = {
+    farBelow = { 0.80, 0.16, 0.16 },
+    below = { 0.95, 0.45, 0.38 },
+    at = { 0.40, 1.00, 0.45 },
+    above = { 0.38, 0.66, 1.00 },
+    farAbove = { 0.22, 0.44, 1.00 },
+    neutral = { 0.55, 0.55, 0.60 },
+}
+
+local function BandFromPct(pct)
+    pct = pct or 0
+    if pct <= -20 then
+        return "farBelow"
+    elseif pct <= -5 then
+        return "below"
+    elseif pct < 5 then
+        return "at"
+    elseif pct <= 30 then
+        return "above"
+    else
+        return "farAbove"
+    end
+end
+
+local function SetBarBand(bar, band)
+    if bar._colorBand == band then return end
+    bar._colorBand = band
+    local c = BAR_BAND_COLORS[band] or BAR_BAND_COLORS.neutral
+    bar.fill:SetVertexColor(c[1], c[2], c[3], 1)
+end
+
+local function ApplyBarLayout(bar)
+    local inner = math.max(0, (bar:GetWidth() or 0) - 4)
+    local p = bar.progress or 0
+    local fillW = math.max(p > 0 and 2 or 0, math.min(p * inner, inner))
+    if bar._lastFillW ~= fillW then
+        bar.fill:SetWidth(fillW)
+        bar._lastFillW = fillW
+    end
+    if bar.tick then
+        local tf = bar.tickFrac
+        if tf then
+            local tickX = 2 + math.floor(tf * inner + 0.5)
+            if bar._lastTickX ~= tickX then
+                bar.tick:ClearAllPoints()
+                bar.tick:SetPoint("TOP", bar, "TOPLEFT", tickX, -2)
+                bar.tick:SetPoint("BOTTOM", bar, "BOTTOMLEFT", tickX, 2)
+                bar._lastTickX = tickX
+            end
+            bar.tick:Show()
+        else
+            bar.tick:Hide()
+        end
+    end
+end
+
+local function MakeBar(row)
+    local barFrame = CreateFrame("Frame", nil, row)
+    barFrame:SetPoint("BOTTOMLEFT", HPAD, 3)
+    barFrame:SetPoint("BOTTOMRIGHT", -HPAD, 3)
+    barFrame:SetHeight(BAR_HEIGHT)
+
+    local function colorEdge(layer, r, g, b, a)
+        local t = barFrame:CreateTexture(nil, layer)
+        t:SetColorTexture(r, g, b, a or 1)
+        return t
+    end
+
+    local oTop = colorEdge("BORDER", 0, 0, 0)
+    oTop:SetPoint("TOPLEFT")
+    oTop:SetPoint("TOPRIGHT")
+    oTop:SetHeight(1)
+    local oBot = colorEdge("BORDER", 0, 0, 0)
+    oBot:SetPoint("BOTTOMLEFT")
+    oBot:SetPoint("BOTTOMRIGHT")
+    oBot:SetHeight(1)
+    local oL = colorEdge("BORDER", 0, 0, 0)
+    oL:SetPoint("TOPLEFT")
+    oL:SetPoint("BOTTOMLEFT")
+    oL:SetWidth(1)
+    local oR = colorEdge("BORDER", 0, 0, 0)
+    oR:SetPoint("TOPRIGHT")
+    oR:SetPoint("BOTTOMRIGHT")
+    oR:SetWidth(1)
+
+    local iTop = colorEdge("BORDER", 0.62, 0.51, 0.27)
+    iTop:SetPoint("TOPLEFT", 1, -1)
+    iTop:SetPoint("TOPRIGHT", -1, -1)
+    iTop:SetHeight(1)
+    local iBot = colorEdge("BORDER", 0.62, 0.51, 0.27)
+    iBot:SetPoint("BOTTOMLEFT", 1, 1)
+    iBot:SetPoint("BOTTOMRIGHT", -1, 1)
+    iBot:SetHeight(1)
+    local iL = colorEdge("BORDER", 0.62, 0.51, 0.27)
+    iL:SetPoint("TOPLEFT", 1, -1)
+    iL:SetPoint("BOTTOMLEFT", 1, 1)
+    iL:SetWidth(1)
+    local iR = colorEdge("BORDER", 0.62, 0.51, 0.27)
+    iR:SetPoint("TOPRIGHT", -1, -1)
+    iR:SetPoint("BOTTOMRIGHT", -1, 1)
+    iR:SetWidth(1)
+
+    local barBg = barFrame:CreateTexture(nil, "BACKGROUND")
+    barBg:SetPoint("TOPLEFT", 2, -2)
+    barBg:SetPoint("BOTTOMRIGHT", -2, 2)
+    barBg:SetColorTexture(0.05, 0.05, 0.05, 1)
+
+    local innerShadow = barFrame:CreateTexture(nil, "BACKGROUND", nil, 1)
+    innerShadow:SetColorTexture(0, 0, 0, 0.55)
+    innerShadow:SetPoint("TOPLEFT", 2, -2)
+    innerShadow:SetPoint("TOPRIGHT", -2, -2)
+    innerShadow:SetHeight(1)
+
+    local fill = barFrame:CreateTexture(nil, "ARTWORK")
+    fill:SetPoint("TOPLEFT", 2, -2)
+    fill:SetPoint("BOTTOMLEFT", 2, 2)
+    fill:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    fill:SetVertexColor(0.85, 0.45, 0.45, 1)
+    fill:SetWidth(0)
+
+    local glossHeight = math.max(2, math.floor((BAR_HEIGHT - 4) * 0.4))
+    local gloss = barFrame:CreateTexture(nil, "OVERLAY")
+    gloss:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    gloss:SetVertexColor(1, 1, 1, 0.16)
+    gloss:SetBlendMode("ADD")
+    gloss:SetPoint("TOPLEFT", fill, "TOPLEFT", 0, 0)
+    gloss:SetPoint("TOPRIGHT", fill, "TOPRIGHT", 0, 0)
+    gloss:SetHeight(glossHeight)
+
+    local tick = barFrame:CreateTexture(nil, "OVERLAY")
+    tick:SetColorTexture(0.95, 0.86, 0.55, 0.95)
+    tick:SetWidth(2)
+    barFrame.tick = tick
+
+    barFrame:SetScript("OnSizeChanged", function(self)
+        ApplyBarLayout(self)
+    end)
+    barFrame.fill = fill
+    return barFrame
+end
+
+local function tgtSubHeaderHeight(inst)
+    return (inst.subHeader and inst.subHeader:GetHeight()) or ns.SECTION_HEADER_HEIGHT or 28
+end
+
+local function buildTargets(inst, opts)
+    inst.section = CreateFrame("Frame", nil, opts.parent)
+    inst.content = CreateFrame("Frame", nil, inst.section)
+    inst.content:SetPoint("TOPLEFT", 0, 0)
+    inst.content:SetPoint("RIGHT", 0, 0)
+    inst.content:SetHeight(140)
+
+    inst.subHeader = ns.CreateSectionHeader(inst.content, L["section.stat_targets"] or "Stat Targets", false)
+    inst.subHeader:ClearAllPoints()
+    inst.subHeader:SetPoint("TOPLEFT", 0, 0)
+    inst.subHeader:SetPoint("TOPRIGHT", 0, 0)
+    if inst.subHeader.topDivider then inst.subHeader.topDivider:Show() end
+
+    inst.uggIcon = ns.CreateSourceAttributionIcon(inst.subHeader, "ugg", "Stat targets", "Data from U.GG", function()
+        if ns.ResolveAttribution and ns.GetClassAndSpec then
+            local class, spec = ns.GetClassAndSpec()
+            local _, url = ns.ResolveAttribution("stats", class, spec)
+            return url
+        end
+    end)
+    if inst.subHeader.AddHeaderWidget then inst.subHeader:AddHeaderWidget(inst.uggIcon) end
+
+    local binCog = CreateFrame("Button", nil, inst.subHeader)
+    binCog:SetSize(14, 14)
+    binCog:RegisterForClicks("LeftButtonUp")
+    local binCogIcon = binCog:CreateTexture(nil, "ARTWORK")
+    binCogIcon:SetAllPoints()
+    binCogIcon:SetAtlas("QuestLog-icon-setting")
+    binCogIcon:SetVertexColor(0.6, 0.6, 0.6)
+    binCog:SetScript("OnEnter", function(self)
+        binCogIcon:SetVertexColor(1, 1, 1)
+        ns.Tooltip
+            .Open(self, "ANCHOR_RIGHT")
+            .Title(L["section.stat_targets"] or "Stat Targets")
+            .Hint(L["stat_targets.bin_picker"] or "")
+            .Show()
+    end)
+    binCog:SetScript("OnLeave", function()
+        binCogIcon:SetVertexColor(0.6, 0.6, 0.6)
+        ns.Tooltip.Hide()
+    end)
+    binCog:SetScript("OnClick", function(self)
+        if not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+        MenuUtil.CreateContextMenu(self, function(_, root)
+            root:CreateTitle(L["section.stat_targets"] or "Stat Targets")
+            for _, b in ipairs(ns.STAT_TARGET_BINS) do
+                local key = b.key
+                local radio = root:CreateRadio(ns.StatTargetBinLabel(key), function()
+                    return ns.GetStatTargetBin() == key
+                end, function()
+                    ns.SetStatTargetBin(key)
+                    if ns.InvalidateTooltipCache then ns.InvalidateTooltipCache() end
+                    if inst.lastArgs then renderTargets(inst, inst.lastArgs) end
+                    return MenuResponse.Refresh
+                end)
+                local desc = ns.StatTargetBinTooltip and ns.StatTargetBinTooltip(key)
+                if desc and radio and radio.SetTooltip then
+                    radio:SetTooltip(function(tip)
+                        ns.Tooltip.MenuTip(tip, ns.StatTargetBinLabel(key), desc)
+                    end)
+                end
+            end
+            root:CreateDivider()
+            root:CreateTitle(L["settings.value.view"] or "View")
+            local unitTips = {
+                values = "Shows your current rating next to the target rating.",
+                pct = "Shows the percent the character pane would report at the target rating.",
+            }
+            for _, unit in ipairs({ "values", "pct" }) do
+                local labelKey = unit == "values" and "settings.value.stat_targets_values"
+                    or "settings.value.stat_targets_percent"
+                local fallback = unit == "values" and "Values" or "Percentages"
+                local radio = root:CreateRadio(L[labelKey] or fallback, function()
+                    return ns.StatTargetUnit() == unit
+                end, function()
+                    ns.SetStatTargetUnit(unit)
+                    if ns.InvalidateTooltipCache then ns.InvalidateTooltipCache() end
+                    if inst.lastArgs then renderTargets(inst, inst.lastArgs) end
+                    return MenuResponse.Refresh
+                end)
+                if radio and radio.SetTooltip then
+                    radio:SetTooltip(function(tip)
+                        ns.Tooltip.MenuTip(tip, L[labelKey] or fallback, unitTips[unit])
+                    end)
+                end
+            end
+        end)
+    end)
+    binCog:Hide()
+    inst.binCog = binCog
+    if ns.MakeCogGlow then
+        ns.MakeCogGlow(binCog, binCogIcon)
+        ns.MakeLabelMenuHotspot(inst.subHeader, binCog)
+    end
+    if inst.subHeader.AddHeaderWidget then inst.subHeader:AddHeaderWidget(binCog) end
+
+    inst.ctxDropdown = ns.CreateOptionDropdown(inst.ddName, inst.content)
+    inst.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
+    inst.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
+
+    inst.rows = {}
+    for i = 1, TGT_MAX_ROWS do
+        local row = CreateFrame("Frame", nil, inst.content)
+        row:SetHeight(TGT_ROW_HEIGHT)
+        row:SetPoint("LEFT", 0, 0)
+        row:SetPoint("RIGHT", 0, 0)
+
+        local bar = MakeBar(row)
+        row.bar = bar
+
+        -- The text line hugs the bar's top edge; the icon and the numbers hang
+        -- off it with RIGHT/BOTTOM anchors so all three share one centerline.
+        local statusIcon = row:CreateTexture(nil, "ARTWORK")
+        statusIcon:SetSize(14, 14)
+        statusIcon:SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT", 0, 1)
+        row.statusIcon = statusIcon
+
+        local rating = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        -- Fixed width so a long "24.5% / 30.1%" can never encroach on the
+        -- stat name at narrow panel widths (an auto-width right-anchored
+        -- string grows leftward and squeezes the name to a negative width,
+        -- which renders as the two texts colliding).
+        rating:SetWidth(112)
+        rating:SetPoint("RIGHT", statusIcon, "LEFT", -4, 0)
+        rating:SetJustifyH("RIGHT")
+        row.rating = rating
+
+        local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        name:SetPoint("BOTTOMLEFT", bar, "TOPLEFT", 0, 2)
+        name:SetPoint("RIGHT", rating, "LEFT", -4, 0)
+        name:SetJustifyH("LEFT")
+        row.statName = name
+        inst.rows[i] = row
+    end
+
+    inst.emptyFallback = inst.content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    inst.emptyFallback:SetTextColor(0.5, 0.5, 0.5)
+    inst.emptyFallback:SetJustifyH("CENTER")
+    inst.emptyFallback:SetWordWrap(true)
+    inst.emptyFallback:Hide()
+end
+
+local function resetBinChrome(inst)
+    if inst.binCog then inst.binCog:Hide() end
+    if inst.subHeader and inst.subHeader.label then
+        inst.subHeader.label:SetText(L["section.stat_targets"] or "Stat Targets")
+    end
+end
+
+function renderTargets(inst, args)
+    inst.lastArgs = args
+    inst.emptyFallback:Hide()
+    local classToken = args.classToken
+    local specKey = args.specKey
+    local src = args.source
+    if not classToken or not specKey then
+        for i = 1, TGT_MAX_ROWS do
+            inst.rows[i]:Hide()
+        end
+        if inst.uggIcon then inst.uggIcon:Hide() end
+        resetBinChrome(inst)
+        return 0
+    end
+
+    -- The pane/compendium hero selection drives the targets; only fall back
+    -- to the active-hero logic when no selection was passed.
+    local heroSlug = (args.heroTalent and ns.HeroSlugFromDisplay and ns.HeroSlugFromDisplay(args.heroTalent)) or nil
+
+    -- Contexts offered depend on the view: PvP shows its own targets, PvE
+    -- views offer Mythic+/Raid.
+    local viewCt = args.contentType or (ns.Context and ns.Context.contentType())
+    local isPvpView = type(viewCt) == "string" and viewCt:sub(1, 3) == "pvp"
+    local CONTEXT_OPTIONS = isPvpView and { "PvP" } or { "Mythic+", "Raid" }
+    local availableContexts = {}
+    for _, ctx in ipairs(CONTEXT_OPTIONS) do
+        if ns.GetStatTargets(classToken, specKey, ctx, src, heroSlug) then
+            availableContexts[#availableContexts + 1] = ctx
+        end
+    end
+
+    if #availableContexts == 0 then
+        inst.ctxDropdown:Hide()
+        for i = 1, TGT_MAX_ROWS do
+            inst.rows[i]:Hide()
+        end
+        if inst.uggIcon then inst.uggIcon:Hide() end
+        resetBinChrome(inst)
+        -- A spec with no targets at all (e.g. a young season with too few
+        -- parses) still gets the section, with a note instead of rows —
+        -- callers treat any positive return as "section shown".
+        local yOffset = -(tgtSubHeaderHeight(inst) + 12)
+        inst.emptyFallback:SetText(L["empty.no_stat_targets"] or "Stat targets coming soon.")
+        inst.emptyFallback:ClearAllPoints()
+        inst.emptyFallback:SetPoint("TOPLEFT", inst.content, "TOPLEFT", HPAD, yOffset)
+        inst.emptyFallback:SetPoint("TOPRIGHT", inst.content, "TOPRIGHT", -HPAD, yOffset)
+        inst.emptyFallback:Show()
+        return 1
+    end
+
+    local CT_MAP = { mplus = "Mythic+", raid = "Raid", pvp = "PvP" }
+    local wantCtx = args.contentType and CT_MAP[args.contentType]
+    if not wantCtx then wantCtx = ns.Context and CT_MAP[ns.Context.contentType()] end
+    if wantCtx and ns.GetStatTargets(classToken, specKey, wantCtx, src, heroSlug) then
+        inst.currentCtx = wantCtx
+    elseif not inst.currentCtx or not ns.GetStatTargets(classToken, specKey, inst.currentCtx, src, heroSlug) then
+        inst.currentCtx = availableContexts[1]
+    end
+    inst.ctxDropdown:Hide()
+
+    local snapshot = ns.GetStatTargets(classToken, specKey, inst.currentCtx, src, heroSlug)
+    if not snapshot or not snapshot.targets then
+        for i = 1, TGT_MAX_ROWS do
+            inst.rows[i]:Hide()
+        end
+        resetBinChrome(inst)
+        return 0
+    end
+
+    local showCurrent = args.showCurrent ~= false
+
+    -- The cog now also carries the goal-percent toggle, so it stays present
+    -- like the priority cog; the bin suffix stays multi-bin only.
+    if inst.binCog then inst.binCog:SetShown(true) end
+    if inst.subHeader and inst.subHeader.label then
+        local base = L["section.stat_targets"] or "Stat Targets"
+        if snapshot.multiBin then
+            inst.subHeader.label:SetText(base .. " " .. ns.DOT_SEPARATOR .. " " .. ns.StatTargetBinLabel(snapshot.bin))
+        else
+            inst.subHeader.label:SetText(base)
+        end
+    end
+
+    local yOffset = -(tgtSubHeaderHeight(inst) + 4)
+    local visibleCount = 0
+    local pctMode = ns.StatTargetUnit and ns.StatTargetUnit() == "pct"
+
+    for _, statKey in ipairs(DISPLAY_ORDER) do
+        local target = snapshot.targets[statKey] or 0
+        local hasTarget = target > 0
+        visibleCount = visibleCount + 1
+        local row = inst.rows[visibleCount]
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", inst.content, "TOPLEFT", 0, yOffset)
+        row:SetPoint("TOPRIGHT", inst.content, "TOPRIGHT", 0, yOffset)
+        row:Show()
+        yOffset = yOffset - TGT_ROW_HEIGHT - TGT_ROW_GAP
+
+        row.statName:SetText(ns.STAT_LABELS[statKey] or statKey)
+
+        local bar = row.bar
+        local band = "neutral"
+        local progress = 0
+        local tickFrac = hasTarget and TARGET_TICK_FRAC or nil
+
+        if showCurrent then
+            local current = ns.GetPlayerStatRating(statKey)
+            local livePct = ns.GetPlayerStatPercent(statKey)
+            if hasTarget and current then
+                progress = math.min((current / target) * TARGET_TICK_FRAC, 1)
+                local kind, pct = ns.ClassifyStatDelta(current, target)
+                band = BandFromPct(pct)
+                local status = STATUS_ICONS[kind or "below"]
+                row.statusIcon:SetTexture(status.texture)
+                row.statusIcon:SetTexCoord(
+                    status.texCoord[1],
+                    status.texCoord[2],
+                    status.texCoord[3],
+                    status.texCoord[4]
+                )
+                row.statusIcon:SetVertexColor(status.r, status.g, status.b)
+                row.statusIcon:Show()
+                -- Rows carry one unit, never both: percents (current/goal,
+                -- DR-aware) or values (current/target ratings). Gray always
+                -- marks the reference side of the pair.
+                if pctMode then
+                    local goalPct = livePct
+                        and ns.StatGoalPercent
+                        and ns.StatGoalPercent(statKey, livePct, current, target)
+                    if goalPct then
+                        row.rating:SetText(string.format("%.1f%% |cff9a9a9a/ %.1f%%|r", livePct, goalPct))
+                    else
+                        row.rating:SetText(livePct and string.format("%.1f%%", livePct) or "—")
+                    end
+                else
+                    row.rating:SetText(string.format("%d |cff9a9a9a/ %d|r", current, target))
+                end
+            elseif hasTarget then
+                row.statusIcon:Hide()
+                if pctMode then
+                    local pct = ns.StatTargetPercent and ns.StatTargetPercent(statKey, target, classToken, specKey)
+                    row.rating:SetText(pct and string.format("%.1f%%", pct) or "—")
+                else
+                    row.rating:SetText(string.format("|cff9a9a9a— / %d|r", target))
+                end
+            else
+                tickFrac = nil
+                row.statusIcon:Hide()
+                row.rating:SetText(current and string.format("%.1f%%", livePct) or "—")
+            end
+            local marginal = ns.GetMarginalDR and ns.GetMarginalDR(livePct) or 1
+            if marginal >= 1 then
+                row.rating:SetTextColor(0.85, 0.85, 0.85)
+            elseif marginal >= 0.8 then
+                row.rating:SetTextColor(1, 0.85, 0.4)
+            elseif marginal >= 0.6 then
+                row.rating:SetTextColor(1, 0.65, 0.1)
+            else
+                row.rating:SetTextColor(1, 0.4, 0.2)
+            end
+            row:EnableMouse(true)
+            row.statKey = statKey
+            row.snapshot = snapshot
+            if not row._statTooltipBound then
+                row:SetScript("OnEnter", function(self)
+                    if not self.statKey then return end
+                    ns.Tooltip.Open(self, "ANCHOR_RIGHT")
+                    if ns.AppendStatExtrasToTooltip then
+                        ns.AppendStatExtrasToTooltip(GameTooltip, self.statKey, self.snapshot, { includeTitle = true })
+                    end
+                    ns.Tooltip.Show()
+                end)
+                row:SetScript("OnLeave", function()
+                    ns.Tooltip.Hide()
+                end)
+                row._statTooltipBound = true
+            end
+        else
+            row.statusIcon:Hide()
+            row:EnableMouse(false)
+            row.rating:SetTextColor(0.85, 0.85, 0.85)
+            if hasTarget then
+                progress = TARGET_TICK_FRAC
+                -- No live stats here (compendium specs other than the
+                -- player's): percentage mode shows each target's own percent,
+                -- mastery via the per-spec coefficient table.
+                local pct = pctMode
+                    and ns.StatTargetPercent
+                    and ns.StatTargetPercent(statKey, target, classToken, specKey)
+                if pct then
+                    row.rating:SetText(string.format("%.1f%%", pct))
+                else
+                    row.rating:SetText(string.format("|cff9a9a9a%d|r", target))
+                end
+            else
+                tickFrac = nil
+                row.rating:SetText("")
+            end
+        end
+
+        bar.progress = progress
+        bar.tickFrac = tickFrac
+        SetBarBand(bar, band)
+        ApplyBarLayout(bar)
+    end
+
+    for i = visibleCount + 1, TGT_MAX_ROWS do
+        inst.rows[i]:Hide()
+    end
+
+    if inst.uggIcon then
+        local curSource = args.source or (ns.ActiveSource and ns.ActiveSource()) or "icyveins"
+        inst.uggIcon:SetShown(visibleCount > 0 and curSource == "icyveins")
+    end
+
+    return visibleCount
+end
+
+local function targetsHeight(inst)
+    local h = tgtSubHeaderHeight(inst) + 4
+    if inst.ctxDropdown:IsShown() then h = h + 28 end
+    local n = 0
+    for i = 1, TGT_MAX_ROWS do
+        if inst.rows[i]:IsShown() then n = n + 1 end
+    end
+    if n > 0 then
+        h = h + n * TGT_ROW_HEIGHT + (n - 1) * TGT_ROW_GAP + 4
+    elseif inst.emptyFallback:IsShown() then
+        h = h + 44
+    end
+    return h
+end
+
+-- ============================================================
+-- Instances + public API
+-- ============================================================
+
+local priPanel = { ddName = "ClassCodexStatCtxDropdown" }
+local priComp = { ddName = "ClassCodexCompStatCtxDropdown" }
+local tgtPanel = { ddName = "ClassCodexStatTargetCtxDropdown" }
+local tgtComp = { ddName = "ClassCodexCompStatTargetCtxDropdown" }
+
+-- Stat Priority
+
+function Stats.InitPanel(opts)
+    buildPriority(priPanel, opts, false)
+    makeCog(priPanel, opts.refresh)
+    placeCog(priPanel)
+    return priPanel.section, priPanel.header, priPanel.content
+end
+
+function Stats.RenderPanel(args)
+    return renderPriority(priPanel, args)
+end
+
+function Stats.GetPanelContentHeight(visibleRowCount)
+    if visibleRowCount then
+        local h = visibleRowCount * ns.ROW_HEIGHT
+        if priPanel.ctxDropdown and priPanel.ctxDropdown:IsShown() then h = h + 30 end
+        return h
+    end
+    return priorityHeight(priPanel)
+end
+
+function Stats.InitCompendium(opts)
+    buildPriority(priComp, opts, true)
+    makeCog(priComp, opts.refresh)
+    placeCog(priComp)
+    return priComp.section, priComp.header, priComp.content
+end
+
+function Stats.RenderCompendium(args)
+    return renderPriority(priComp, args)
+end
+
+function Stats.GetCompendiumContentHeight()
+    return priorityHeight(priComp)
+end
+
+-- Stat Targets
+
+function Stats.InitStatTargets(opts)
+    buildTargets(tgtPanel, opts)
+    return tgtPanel.section
+end
+
+function Stats.GetStatTargetsContent()
+    return tgtPanel.content
+end
+
+function Stats.GetStatTargetsHeight()
+    return targetsHeight(tgtPanel)
+end
+
+function Stats.RenderStatTargets(args)
+    return renderTargets(tgtPanel, args)
+end
+
+function Stats.InitCompendiumStatTargets(opts)
+    buildTargets(tgtComp, opts)
+    return tgtComp.section, tgtComp.content
+end
+
+function Stats.RenderCompendiumStatTargets(args)
+    return renderTargets(tgtComp, args)
+end
+
+function Stats.GetCompendiumStatTargetsHeight()
+    return targetsHeight(tgtComp)
 end

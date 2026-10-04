@@ -1,25 +1,7 @@
 local _, ns = ...
 
--------------------------------------------------------------------------------
--- StatTargets: secondary-stat rating targets for PvE (M+/Raid), summed from the
--- u.gg BiS gear list (item stats resolved at their ilvl). The sum of the
--- recommended gear is the stat profile a player builds toward.
---
--- Data is read through the SourceData seam off the normalized db_ugg file:
---   ns.ResolveAny(class, spec, "statTargets", "all", ctx) -> { crit, haste, mastery, versatility }
---   ctx = "mplus" | "raid"
---
--- This module exposes:
---   ns.GetStatTargets(classToken, specKey, context) -> snapshot or nil
---   ns.GetPlayerStatRating(statKey) -> integer rating
---   ns.GetPlayerStatPercent(statKey) -> number (percent, e.g. 22.4)
---   ns.STAT_KEYS / ns.STAT_LABELS / ns.UNIVERSAL_DR
--------------------------------------------------------------------------------
-
--- Stat keys shared across scraper + addon.
 ns.STAT_KEYS = { "crit", "haste", "mastery", "versatility" }
 
--- Canonical display labels (match u.gg priority entries exactly).
 ns.STAT_LABELS = {
     crit = "Critical Strike",
     haste = "Haste",
@@ -27,15 +9,60 @@ ns.STAT_LABELS = {
     versatility = "Versatility",
 }
 
--- Reverse lookup: display label -> stat key.
 ns.STAT_KEY_FROM_LABEL = {}
 for key, label in pairs(ns.STAT_LABELS) do
     ns.STAT_KEY_FROM_LABEL[label] = key
 end
 
--- Universal diminishing-returns rating thresholds in The War Within.
--- Above these ratings, each point of rating is less effective.
--- Documented on u.gg's "Secondary Stats and Diminishing Returns" guide.
+ns.STAT_TARGET_BINS = {
+    { key = "top20", pct = 20 },
+    { key = "top50", pct = 50 },
+    { key = "top80", pct = 80 },
+}
+
+local BIN_PCT = {}
+for _, b in ipairs(ns.STAT_TARGET_BINS) do
+    BIN_PCT[b.key] = b.pct
+end
+
+function ns.GetStatTargetBin()
+    local b = ClassCodexDB and ClassCodexDB.statTargetBin
+    if BIN_PCT[b] then return b end
+    return "top20"
+end
+
+function ns.SetStatTargetBin(bin)
+    if not BIN_PCT[bin] or not ClassCodexDB then return end
+    ClassCodexDB.statTargetBin = bin
+end
+
+function ns.StatTargetBinLabel(bin)
+    local pct = BIN_PCT[bin] or BIN_PCT.top20
+    local fmt = (ns.L and ns.L["stat_targets.bin"]) or "Top %d%%"
+    return string.format(fmt, pct)
+end
+
+function ns.StatTargetBinTooltip(bin)
+    return ns.L and ns.L["stat_targets.bin_desc." .. bin]
+end
+
+local function binsDiffer(leaf)
+    local first
+    for _, b in ipairs(ns.STAT_TARGET_BINS) do
+        local t = leaf[b.key]
+        if t then
+            if not first then
+                first = t
+            else
+                for _, k in ipairs(ns.STAT_KEYS) do
+                    if (first[k] or 0) ~= (t[k] or 0) then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
 ns.UNIVERSAL_DR = {
     crit = 1380,
     haste = 1320,
@@ -43,10 +70,6 @@ ns.UNIVERSAL_DR = {
     versatility = 1620,
 }
 
--- DR brackets by stat percentage (post-DR character-sheet value). Once a
--- secondary stat % crosses a bracket boundary, every additional rating
--- point converts at the bracket's multiplier. The values match the
--- well-published TWW formula used by True Stat Values / Bagnon Stat etc.
 ns.DR_BRACKETS = {
     { pct = 30, mult = 1.00 },
     { pct = 39, mult = 0.90 },
@@ -56,9 +79,6 @@ ns.DR_BRACKETS = {
     { pct = math.huge, mult = 0.50 },
 }
 
--- Returns the marginal effectiveness multiplier (0..1) for the player's
--- next rating point given their current stat % — i.e. "the next rating
--- point gives X% of its linear value."
 function ns.GetMarginalDR(currentPct)
     if not currentPct or currentPct <= 0 then return 1 end
     for _, b in ipairs(ns.DR_BRACKETS) do
@@ -67,87 +87,247 @@ function ns.GetMarginalDR(currentPct)
     return 0.5
 end
 
--------------------------------------------------------------------------------
--- Data lookup (u.gg PvE).
--------------------------------------------------------------------------------
-
--- Canonicalise a context string to the keys used in data files.
--- Accepts common aliases so callers don't need to worry about exact spelling.
 local function NormalizeContext(ctx)
     if not ctx then return nil end
     local lc = ctx:lower()
+    if lc:find("pvp") then return "PvP" end
     if lc:find("raid") then return "Raid" end
-    if lc:find("mythic+") or lc:find("m+") or lc:find("dungeon") then
-        return "Mythic+"
-    end
+    if lc:find("mythic+") or lc:find("m+") or lc:find("dungeon") then return "Mythic+" end
     return nil
 end
 
--- Returns the stat-target snapshot for the given (class, spec, context), or nil.
--- Snapshot shape: { targets = { crit, haste, mastery, versatility } }
--- (the u.gg source URL is resolved separately via ns.SourceSpec(...).links.)
-function ns.GetStatTargets(classToken, specKey, context)
+local function ActiveHeroSlug()
+    local display = ns.GetActiveHeroTalentName and ns.GetActiveHeroTalentName()
+    return ns.HeroSlugFromDisplay and ns.HeroSlugFromDisplay(display) or nil
+end
+
+function ns.HeroSlugFromDisplay(display)
+    if not display or display == "" or display == "All" then return "all" end
+    local hn = ClassCodexSource
+        and ClassCodexSource.ugg
+        and ClassCodexSource.ugg.reference
+        and ClassCodexSource.ugg.reference.heroNames
+    if hn then
+        for slug, name in pairs(hn) do
+            if name == display then return slug end
+        end
+    end
+    return display:lower():gsub(" ", "-")
+end
+
+function ns.GetStatTargets(classToken, specKey, context, source, heroSlug)
     if not classToken or not specKey then return nil end
     local normalized = NormalizeContext(context)
     if not normalized then return nil end
 
-    -- Reads the normalized structure via the source-generic seam: statTargets is
-    -- keyed [hero=all][mplus|raid]; whichever source provides it wins.
-    local ctx = (normalized == "Mythic+") and "mplus" or "raid"
-    local targets = ns.ResolveAny and ns.ResolveAny(classToken, specKey, "statTargets", "all", ctx)
+    local ctx = (normalized == "Mythic+") and "mplus" or (normalized == "PvP") and "pvp" or "raid"
+    -- An explicit slug (the pane/compendium hero selection) wins; otherwise the
+    -- in-game active hero for the player's own spec, else the aggregate.
+    local hero = heroSlug
+    if not hero then
+        hero = "all"
+        local pc, ps
+        if ns.GetClassAndSpec then
+            pc, ps = ns.GetClassAndSpec()
+        end
+        if pc == classToken and ps == specKey then hero = ActiveHeroSlug() or "all" end
+    end
+
+    source = source or (ns.ActiveSource and ns.ActiveSource())
+    local targets = ns.SourceValue and ns.SourceValue(source, classToken, specKey, "statTargets", hero, ctx)
+    if not targets and source ~= "ugg" then
+        targets = ns.SourceValue and ns.SourceValue("ugg", classToken, specKey, "statTargets", hero, ctx)
+    end
     if not targets then return nil end
-    return { targets = targets }
+
+    local bin = ns.GetStatTargetBin()
+    local isBinned = targets.top20 ~= nil or targets.top50 ~= nil or targets.top80 ~= nil
+    local chosen, usedBin
+    if isBinned then
+        if targets[bin] then
+            chosen, usedBin = targets[bin], bin
+        else
+            chosen = targets.top20 or targets.top50 or targets.top80
+            usedBin = targets.top20 and "top20" or targets.top50 and "top50" or "top80"
+        end
+    else
+        chosen, usedBin = targets, "top20"
+    end
+    if not chosen then return nil end
+    return { targets = chosen, bin = usedBin, multiBin = isBinned and binsDiffer(targets) or false }
 end
 
--------------------------------------------------------------------------------
--- Live player stats (WoW API accessors).
--------------------------------------------------------------------------------
+local STAT_PRIORITY_DISPLAY =
+    { crit = "Critical Strike", haste = "Haste", mastery = "Mastery", versatility = "Versatility" }
+
+--- SourceValue's full triple (payload, hero, context) for a statPriority
+--- lookup — the hit context tells callers whether a genuine entry resolved or
+--- the wildcard fallback did.
+local function statPriorityValue(source, classToken, specKey, hero, context)
+    if not ns.SourceValue then return nil, nil, nil end
+    return ns.SourceValue(source, classToken, specKey, "statPriority", hero, context)
+end
+
+local function resolveStatPriority(classToken, specKey, context, source, heroSlug)
+    if not classToken or not specKey then return nil end
+    local hero = heroSlug
+    -- "all" must go through the same active-hero resolution as nil: u.gg keys
+    -- statPriority per hero (its "all" bucket only carries PvP), so a literal
+    -- "all" lookup shows nothing in PvE views even on the player's own spec.
+    if not hero or hero == "all" then
+        hero = "all"
+        local pc, ps
+        if ns.GetClassAndSpec then
+            pc, ps = ns.GetClassAndSpec()
+        end
+        if pc == classToken and ps == specKey then hero = ActiveHeroSlug() or "all" end
+    end
+    source = source or (ns.ActiveSource and ns.ActiveSource())
+    local sp, _, hitCtx = statPriorityValue(source, classToken, specKey, hero, context or "all")
+    if
+        not (sp and sp.secondary)
+        and context == "pvp"
+        and ns.HasPvpGuide
+        and not ns.HasPvpGuide(source, classToken, specKey)
+    then
+        return nil
+    end
+    if not (sp and sp.secondary) and context and context ~= "all" then
+        sp, _, hitCtx = statPriorityValue(source, classToken, specKey, hero, "all")
+    end
+    if not (sp and sp.secondary) then return nil end
+    return sp, hitCtx
+end
+
+--- Returns the display tiers, plus the context key the data actually resolved
+--- through ("mplus", "damage", "all" for the wildcard fallback, …) — callers
+--- use it to tell a genuine per-context priority from the general one.
+function ns.GetStatPriority(classToken, specKey, context, source, heroSlug)
+    local sp, hitCtx = resolveStatPriority(classToken, specKey, context, source, heroSlug)
+    if not sp then return nil end
+    local tiers = {}
+    for _, tier in ipairs(sp.secondary) do
+        local names = {}
+        for _, k in ipairs(tier) do
+            -- Qualified entries ({stat="haste",note="to 22%"}) carry an upstream
+            -- breakpoint ("Haste to 22%"); plain strings are bare keys.
+            local base, note = k, nil
+            if type(k) == "table" then
+                base, note = k.stat, k.note
+            end
+            local name = STAT_PRIORITY_DISPLAY[base] or base
+            if note and note ~= "" then name = name .. " " .. note end
+            names[#names + 1] = name
+        end
+        if #names > 0 then tiers[#tiers + 1] = names end
+    end
+    if #tiers == 0 then return nil end
+    return tiers, hitCtx
+end
+
+--- Qualified breakpoint entries in a spec's priority ("Haste to 22%",
+--- "Haste (until 1800 rating)"), keyed by display name:
+--- { statKey, tier, kind = "pct"|"rating", value }. While the player is below
+--- the threshold the stat ranks at the qualified tier; from the threshold up,
+--- its bare tier (if any) applies. Notes without a readable threshold are
+--- ignored — there is no value to compare against.
+function ns.GetStatBreakpoints(classToken, specKey, context, source, heroSlug)
+    local sp = resolveStatPriority(classToken, specKey, context, source, heroSlug)
+    if not sp then return nil end
+    local out
+    for i, tier in ipairs(sp.secondary) do
+        for _, k in ipairs(tier) do
+            if type(k) == "table" and k.stat then
+                local note = k.note or ""
+                -- Percent thresholds ("to 22%") compare against the player's
+                -- stat percent; explicit ratings ("until 1800 rating") and bare
+                -- "to N" numbers ("to 700+", "to 200") against the rating.
+                local kind, value
+                local pct = note:match("(%d+%.?%d*)%s*%%")
+                local rating = note:match("(%d+)%s*rating") or note:match("to%s+(%d+)")
+                if pct then
+                    kind, value = "pct", tonumber(pct)
+                elseif rating then
+                    kind, value = "rating", tonumber(rating)
+                end
+                if kind then
+                    out = out or {}
+                    out[STAT_PRIORITY_DISPLAY[k.stat] or k.stat] =
+                        { statKey = k.stat, tier = i, kind = kind, value = value }
+                end
+            end
+        end
+    end
+    return out
+end
 
 local function safeNum(v)
     if type(v) == "number" then return v end
     return 0
 end
 
--- Rating is the integer "X Haste rating" number shown in the character sheet.
+-- Player stat readings are refreshed out of combat and served from cache while
+-- in combat, so panels/tooltips render consistently mid-fight instead of
+-- fluctuating with procs (or blanking out behind a combat warning).
+local PLAYER_STAT_READERS = {
+    crit = function()
+        return safeNum(GetCombatRating(CR_CRIT_MELEE)), safeNum(GetCritChance())
+    end,
+    haste = function()
+        return safeNum(GetCombatRating(CR_HASTE_MELEE)), safeNum(GetHaste())
+    end,
+    mastery = function()
+        return safeNum(GetCombatRating(CR_MASTERY)), safeNum(GetMasteryEffect())
+    end,
+    versatility = function()
+        return safeNum(GetCombatRating(CR_VERSATILITY_DAMAGE_DONE)),
+            safeNum(GetCombatRatingBonus(CR_VERSATILITY_DAMAGE_DONE))
+    end,
+}
+
+local playerStatCache = {}
+
+local canUseStatValue
+if canaccessvalue then
+    canUseStatValue = canaccessvalue
+elseif issecretvalue then
+    canUseStatValue = function(v)
+        return not issecretvalue(v)
+    end
+else
+    canUseStatValue = function()
+        return true
+    end
+end
+
+local function readPlayerStat(statKey)
+    local read = PLAYER_STAT_READERS[statKey]
+    if not read then return 0, 0 end
+    if not InCombatLockdown() then
+        local rating, pct = read()
+        if canUseStatValue(rating) and canUseStatValue(pct) then
+            playerStatCache[statKey] = { rating = rating, pct = pct }
+            return rating, pct
+        end
+    end
+    local cached = playerStatCache[statKey]
+    if cached then return cached.rating, cached.pct end
+    local rating, pct = read()
+    if canUseStatValue(rating) and canUseStatValue(pct) then return rating, pct end
+    return nil, nil
+end
+
 function ns.GetPlayerStatRating(statKey)
-    if statKey == "crit" then
-        return safeNum(GetCombatRating(CR_CRIT_MELEE)) -- all three (melee/ranged/spell) match
-    elseif statKey == "haste" then
-        return safeNum(GetCombatRating(CR_HASTE_MELEE))
-    elseif statKey == "mastery" then
-        return safeNum(GetCombatRating(CR_MASTERY))
-    elseif statKey == "versatility" then
-        return safeNum(GetCombatRating(CR_VERSATILITY_DAMAGE_DONE))
-    end
-    return 0
+    return (readPlayerStat(statKey))
 end
 
--- Effective percent visible on the character sheet (includes base + talents + buffs).
 function ns.GetPlayerStatPercent(statKey)
-    if statKey == "crit" then
-        return safeNum(GetCritChance())
-    elseif statKey == "haste" then
-        return safeNum(GetHaste())
-    elseif statKey == "mastery" then
-        return safeNum(GetMasteryEffect())
-    elseif statKey == "versatility" then
-        -- Damage-done bonus from rating only. The earlier double-source
-        -- accumulator (rating + GetVersatilityBonus) double-counted on
-        -- some specs because GetVersatilityBonus' result already
-        -- includes the rating contribution; we now match what
-        -- GetCombatRatingBonus reports for the other secondaries.
-        return safeNum(GetCombatRatingBonus(CR_VERSATILITY_DAMAGE_DONE))
-    end
-    return 0
+    local _, pct = readPlayerStat(statKey)
+    return pct
 end
-
--------------------------------------------------------------------------------
--- Delta classification: how does the player compare to the target?
--- Returns "above" | "at" | "below" along with the percent difference.
--------------------------------------------------------------------------------
 
 function ns.ClassifyStatDelta(currentRating, targetRating)
-    if not targetRating or targetRating <= 0 then return nil, 0 end
+    if not currentRating or not targetRating or targetRating <= 0 then return nil, 0 end
     local diff = currentRating - targetRating
     local pct = (diff / targetRating) * 100
     if math.abs(pct) < 5 then
@@ -159,90 +339,102 @@ function ns.ClassifyStatDelta(currentRating, targetRating)
     end
 end
 
--------------------------------------------------------------------------------
--- Shared tooltip builder — appends target / status lines for a single
--- secondary stat to a GameTooltip. Used by the Stat Targets row hover.
--------------------------------------------------------------------------------
+--- The percent the character pane would show at `targetRating` (DR included),
+--- or nil when the player's live stats can't anchor the extrapolation.
+function ns.StatGoalPercent(statKey, statPct, currentRating, targetRating)
+    if not ns.StatDR then return nil end
+    return ns.StatDR.GoalPercent(statKey, UnitLevel("player"), statPct, currentRating, targetRating)
+end
+
+--- Percent for a bare target rating, for views without the player's live
+--- stats (compendium specs other than the player's). Mastery resolves
+--- through the class/spec coefficient table; nil when that spec has no
+--- quotable per-point value.
+function ns.StatTargetPercent(statKey, targetRating, classToken, specKey)
+    if not ns.StatDR then return nil end
+    return ns.StatDR.TargetPercent(statKey, UnitLevel("player"), targetRating, classToken, specKey)
+end
+
+--- Row unit for stat targets: "pct" shows current/goal percents (DR-aware),
+--- "values" shows current/target ratings. Set from the Stat Targets cog.
+function ns.StatTargetUnit()
+    local unit = ClassCodexDB and ClassCodexDB.statTargetUnit
+    if unit == "values" or unit == "pct" then return unit end
+    return "values"
+end
+
+function ns.SetStatTargetUnit(unit)
+    if unit ~= "values" and unit ~= "pct" then return end
+    if not ClassCodexDB then return end
+    ClassCodexDB.statTargetUnit = unit
+end
 
 local STATE_COLORS = {
-    above = { 0.40, 0.70, 1.00 }, -- blue
-    at    = { 0.40, 1.00, 0.45 }, -- green
-    below = { 1.00, 0.40, 0.40 }, -- red
+    above = { 0.40, 0.70, 1.00 },
+    at = { 0.40, 1.00, 0.45 },
+    below = { 1.00, 0.40, 0.40 },
 }
 
 function ns.AppendStatExtrasToTooltip(tooltip, statKey, snapshot, opts)
     if not tooltip or not statKey then return end
     opts = opts or {}
     local label = ns.STAT_LABELS[statKey] or statKey
-    local current = ns.GetPlayerStatRating(statKey) or 0
-    local livePct = ns.GetPlayerStatPercent(statKey) or 0
+    local current = ns.GetPlayerStatRating(statKey)
+    local livePct = ns.GetPlayerStatPercent(statKey)
     local target = snapshot and snapshot.targets and snapshot.targets[statKey]
 
+    local COLORS = ns.Tooltip.COLORS
+
     if opts.includeTitle then
-        tooltip:AddLine(label, 1, 0.82, 0)
+        local ct = COLORS.title
+        tooltip:AddLine(label, ct[1], ct[2], ct[3])
+        local cl, cr = COLORS.intro, COLORS.muted
         tooltip:AddDoubleLine(
-            string.format("%.1f%%", livePct),
-            string.format("%d rating", current),
-            1, 1, 1, 0.75, 0.75, 0.75)
+            livePct and string.format("%.1f%%", livePct) or "—",
+            current and string.format("%d rating", current) or "—",
+            cl[1],
+            cl[2],
+            cl[3],
+            cr[1],
+            cr[2],
+            cr[3]
+        )
     end
 
     if not opts.omitTarget and target and target > 0 then
         if opts.includeTitle then tooltip:AddLine(" ") end
-        tooltip:AddDoubleLine("Target", string.format("%d", target),
-            0.7, 0.7, 0.7, 1, 1, 1)
-        local kind = ns.ClassifyStatDelta(current, target) or "below"
-        local diff = current - target
-        local sign = (diff >= 0) and "+" or "−"
-        local stateLabels = {
-            above = "Above target",
-            at    = "At target",
-            below = "Below target",
-        }
-        local c = STATE_COLORS[kind]
-        tooltip:AddDoubleLine(stateLabels[kind], string.format("%s%d", sign, math.abs(diff)),
-            c[1], c[2], c[3], c[1], c[2], c[3])
-    end
-end
-
--------------------------------------------------------------------------------
--- Context-aware ranking (drives tooltip # badges).
---
--- Produces { [statLabel] = tier } from a snapshot. Stats within `tolerance`
--- fraction of each other are tied into the same tier, walking sorted (highest
--- rating first). Default tolerance 0.15 means "within 15%".
---
--- Chain-tolerance: if A and B are within tolerance, and B and C are within
--- tolerance of each other, all three share a tier even if A and C exceed the
--- tolerance. Intentional — "close stats share a rank" feels right when the
--- whole cluster is in the same ballpark.
--------------------------------------------------------------------------------
-
-function ns.DeriveSecondaryRanks(snapshot, tolerance)
-    if not snapshot or not snapshot.targets then return nil end
-    tolerance = tolerance or 0.15
-
-    local entries = {}
-    for key, label in pairs(ns.STAT_LABELS) do
-        local val = snapshot.targets[key]
-        if val ~= nil then
-            entries[#entries + 1] = { label = label, value = val }
+        local cl, cr = COLORS.muted, COLORS.intro
+        local targetLabel = "Target"
+        if snapshot and snapshot.multiBin and snapshot.bin and ns.StatTargetBinLabel then
+            targetLabel = string.format("Target (%s)", ns.StatTargetBinLabel(snapshot.bin))
+        end
+        local showPct = ns.StatTargetUnit and ns.StatTargetUnit() == "pct"
+        local goalPct = showPct
+            and current
+            and ns.StatGoalPercent
+            and ns.StatGoalPercent(statKey, livePct, current, target)
+        local targetText = goalPct and string.format("%d (%.1f%%)", target, goalPct) or string.format("%d", target)
+        tooltip:AddDoubleLine(targetLabel, targetText, cl[1], cl[2], cl[3], cr[1], cr[2], cr[3])
+        if current then
+            local kind = ns.ClassifyStatDelta(current, target) or "below"
+            local diff = current - target
+            local sign = (diff >= 0) and "+" or "−"
+            local stateLabels = {
+                above = "Above target",
+                at = "At target",
+                below = "Below target",
+            }
+            local c = STATE_COLORS[kind]
+            tooltip:AddDoubleLine(
+                stateLabels[kind],
+                string.format("%s%d", sign, math.abs(diff)),
+                c[1],
+                c[2],
+                c[3],
+                c[1],
+                c[2],
+                c[3]
+            )
         end
     end
-    if #entries == 0 then return nil end
-
-    table.sort(entries, function(a, b) return a.value > b.value end)
-
-    local ranks = {}
-    local tier = 1
-    ranks[entries[1].label] = tier
-    for i = 2, #entries do
-        local prev = entries[i - 1].value
-        local cur = entries[i].value
-        local gap = (prev > 0) and ((prev - cur) / prev) or 1
-        if gap > tolerance then
-            tier = tier + 1
-        end
-        ranks[entries[i].label] = tier
-    end
-    return ranks
 end

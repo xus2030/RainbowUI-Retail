@@ -6,17 +6,50 @@ local L = ns.L
 local Trinkets = {}
 ns.Sections.Trinkets = Trinkets
 
--------------------------------------------------------------------------------
--- Shared constants + state helpers
--------------------------------------------------------------------------------
+local MAX_ICONS = 40
+local MAX_TIERS = 10
+local ICON_SIZE = 32
+local SLOT_FRAME = math.floor(ICON_SIZE * 1.8125 + 0.5)
+local ICON_STRIDE = 42
+local ROW_STRIDE = 42
+local TIER_LABEL_W = 22
+local TIER_GAP = 6
+local LIST_ROW_H = 40
+local LIST_INSET_X = 8
 
-local MAX_ROWS = 20
+local function viewContext(override)
+    if override then return override end
+    if ns.isFloating and ns.isFloating() then return "float" end
+    return "dock"
+end
+
+function Trinkets.GetViewMode(context)
+    context = viewContext(context)
+    return (ClassCodexDB and ClassCodexDB["trinketView_" .. context]) or "table"
+end
+
+function Trinkets.SetViewMode(mode, context)
+    context = viewContext(context)
+    if not ClassCodexDB then ClassCodexDB = {} end
+    ClassCodexDB["trinketView_" .. context] = mode
+    if context == "comp" then
+        if ns.UpdateCompendiumTrinkets then ns:UpdateCompendiumTrinkets() end
+        if ns.LayoutCompendium then ns:LayoutCompendium() end
+    else
+        if ns.UpdateGearingSections then ns:UpdateGearingSections() end
+        if ns.LayoutPanel then ns:LayoutPanel() end
+    end
+end
 
 local function LoadCtx()
     local specKey = ns.GetSpecKey and ns.GetSpecKey()
-    if specKey and ClassCodexCharDB and ClassCodexCharDB.perSpec
+    if
+        specKey
+        and ClassCodexCharDB
+        and ClassCodexCharDB.perSpec
         and ClassCodexCharDB.perSpec[specKey]
-        and ClassCodexCharDB.perSpec[specKey].trinketContext then
+        and ClassCodexCharDB.perSpec[specKey].trinketContext
+    then
         return ClassCodexCharDB.perSpec[specKey].trinketContext
     end
     return "All"
@@ -26,38 +59,26 @@ local function SaveCtx(ctx)
     local specKey = ns.GetSpecKey and ns.GetSpecKey()
     if not specKey or not ClassCodexCharDB then return end
     if not ClassCodexCharDB.perSpec then ClassCodexCharDB.perSpec = {} end
-    if not ClassCodexCharDB.perSpec[specKey] then
-        ClassCodexCharDB.perSpec[specKey] = {}
-    end
+    if not ClassCodexCharDB.perSpec[specKey] then ClassCodexCharDB.perSpec[specKey] = {} end
     ClassCodexCharDB.perSpec[specKey].trinketContext = ctx
 end
 
--- Trinket data source (default Icy Veins). Stored per current spec, alongside
--- trinketContext; GetSpecGearData reads the same pref so the panel, Compendium
--- and item-tooltip tier all reflect the chosen source.
-local function LoadSource()
+local function LoadHiddenTiers()
     local specKey = ns.GetSpecKey and ns.GetSpecKey()
-    if specKey and ClassCodexCharDB and ClassCodexCharDB.perSpec
-        and ClassCodexCharDB.perSpec[specKey]
-        and ClassCodexCharDB.perSpec[specKey].trinketSource then
-        return ClassCodexCharDB.perSpec[specKey].trinketSource
+    if specKey and ClassCodexCharDB and ClassCodexCharDB.perSpec and ClassCodexCharDB.perSpec[specKey] then
+        return ClassCodexCharDB.perSpec[specKey].trinketHiddenTiers or {}
     end
-    return "icyveins"
+    return {}
 end
 
-local function SaveSource(src)
+local function ToggleHiddenTier(tier)
     local specKey = ns.GetSpecKey and ns.GetSpecKey()
     if not specKey or not ClassCodexCharDB then return end
     if not ClassCodexCharDB.perSpec then ClassCodexCharDB.perSpec = {} end
-    if not ClassCodexCharDB.perSpec[specKey] then
-        ClassCodexCharDB.perSpec[specKey] = {}
-    end
-    ClassCodexCharDB.perSpec[specKey].trinketSource = src
-end
-
-local function SourceHasTrinkets(src, classToken, specKey)
-    local sd = ns.SourceSpec and ns.SourceSpec(src, classToken, specKey)
-    return not not (sd and sd.trinkets and sd.trinkets["all"] and sd.trinkets["all"]["all"])
+    if not ClassCodexCharDB.perSpec[specKey] then ClassCodexCharDB.perSpec[specKey] = {} end
+    local ps = ClassCodexCharDB.perSpec[specKey]
+    ps.trinketHiddenTiers = ps.trinketHiddenTiers or {}
+    ps.trinketHiddenTiers[tier] = (not ps.trinketHiddenTiers[tier]) or nil
 end
 
 local function CollectContexts(trinkets)
@@ -83,21 +104,24 @@ local function FilterAndSort(trinkets, ctxKey)
         local include = not key
         if key and t.contexts then
             for _, ctx in ipairs(t.contexts) do
-                if ctx == key then include = true; break end
+                if ctx == key then
+                    include = true
+                    break
+                end
             end
         end
         if include then filtered[#filtered + 1] = { t = t, i = i } end
     end
-    -- Group by tier, but keep the source's within-tier order: table.sort is not
-    -- stable, so we tie-break on the original index. The data arrives in the
-    -- source's ranked order (e.g. Icy Veins' page order), which we preserve.
+
     table.sort(filtered, function(a, b)
         local ta, tb = TIER_ORDER[a.t.tier] or 99, TIER_ORDER[b.t.tier] or 99
         if ta ~= tb then return ta < tb end
         return a.i < b.i
     end)
     local out = {}
-    for _, w in ipairs(filtered) do out[#out + 1] = w.t end
+    for _, w in ipairs(filtered) do
+        out[#out + 1] = w.t
+    end
     return out
 end
 
@@ -114,327 +138,450 @@ local function SetTierColor(textWidget, tier)
     end
 end
 
--------------------------------------------------------------------------------
--- Panel surface
--------------------------------------------------------------------------------
-
-local panel = {}
-
-function Trinkets.InitPanel(parent)
-    panel.section = CreateFrame("Frame", nil, parent)
-    panel.section:SetHeight(ns.SECTION_HEADER_HEIGHT)
-    panel.title = ns.CreateSectionTitle(panel.section, L["tab.trinkets"])
-    panel.content = CreateFrame("Frame", nil, panel.section)
-    panel.content:SetPoint("TOPLEFT", panel.title, "BOTTOMLEFT", 0, 0)
-    panel.content:SetPoint("RIGHT", 0, 0)
-    panel.content:Show()
-
-    panel.sourceDropdown = ns.CreateOptionDropdown("ClassCodexTrinketSourceDropdown", panel.content)
-    panel.sourceDropdown:SetPoint("TOPLEFT", 0, 0)
-    panel.sourceDropdown:SetPoint("TOPRIGHT", 0, 0)
-    panel.sourceDropdown:Hide()
-
-    panel.ctxDropdown = ns.CreateOptionDropdown("ClassCodexTrinketCtxDropdown", panel.content)
-    panel.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
-    panel.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
-    panel.ctxDropdown:Hide()
-
-    panel.rows = {}
-    for i = 1, MAX_ROWS do
-        local row = CreateFrame("Frame", nil, panel.content)
-        row:SetHeight(ns.ROW_HEIGHT)
-        local ownedBg = row:CreateTexture(nil, "BACKGROUND")
-        ownedBg:SetAllPoints(row)
-        ownedBg:SetColorTexture(0.2, 0.9, 0.2, 0.10)
-        ownedBg:Hide()
-        row.ownedBg = ownedBg
-        local tier = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        tier:SetPoint("LEFT", 2, 0); tier:SetWidth(16); tier:SetJustifyH("CENTER")
-        row.tierText = tier
-        ns.CreateRowIcon(row)
-        row.icon:ClearAllPoints()
-        row.icon:SetPoint("LEFT", tier, "RIGHT", 4, 0)
-        local src = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        src:SetPoint("RIGHT", -2, 0); src:SetWidth(90); src:SetJustifyH("RIGHT")
-        src:SetWordWrap(false); src:SetTextColor(0.5, 0.5, 0.5)
-        row.sourceLabel = src
-        local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        name:SetPoint("LEFT", row.icon, "RIGHT", 4, 0)
-        name:SetPoint("RIGHT", src, "LEFT", -4, 0)
-        name:SetJustifyH("LEFT"); name:SetWordWrap(false)
-        row.itemText = name
-        ns.SetupItemTooltip(row)
-        row:Hide()
-        panel.rows[i] = row
-    end
-    return panel.section
+-- Trinkets live in either inventory slot; "Trinket 1" maps to the pair.
+local function resolveTick(inst, ticksOn, t)
+    if not ticksOn then return nil end
+    if inst.gateOwned and not ns.compOwnClass then return nil end
+    return ns.GearTickForEntry("Trinket 1", t.itemId, t.bonusIDs)
 end
 
-function Trinkets.IsPanelCtxDropdownShown() return panel.ctxDropdown:IsShown() end
-function Trinkets.IsPanelSourceDropdownShown() return panel.sourceDropdown:IsShown() end
+local function makeCog(inst, ctx)
+    if not (inst.header and inst.header.AddHeaderWidget) then return end
+    local cog = CreateFrame("Button", nil, inst.header)
+    cog:SetSize(14, 14)
+    cog:RegisterForClicks("LeftButtonUp")
+    local icon = cog:CreateTexture(nil, "ARTWORK")
+    icon:SetAllPoints()
+    icon:SetAtlas("QuestLog-icon-setting")
+    icon:SetVertexColor(0.6, 0.6, 0.6)
+    cog:SetScript("OnEnter", function(self)
+        icon:SetVertexColor(1, 1, 1)
+        ns.Tooltip.Open(self, "ANCHOR_RIGHT").Title(L["tab.trinkets"] or "Trinkets").Hint(L["trinkets.cog_hint"]).Show()
+    end)
+    cog:SetScript("OnLeave", function()
+        icon:SetVertexColor(0.6, 0.6, 0.6)
+        ns.Tooltip.Hide()
+    end)
+    cog:SetScript("OnClick", function(self)
+        if not (MenuUtil and MenuUtil.CreateContextMenu) then return end
+        MenuUtil.CreateContextMenu(self, function(_, root)
+            local ctxOpts = inst.contextOptions
+            if ctxOpts and #ctxOpts > 1 then
+                root:CreateTitle(L["context.label"] or "Content")
+                root:CreateRadio("All", function()
+                    return inst.currentContext == "All"
+                end, function()
+                    if inst.onContextPick then inst.onContextPick("All") end
+                    return MenuResponse.Refresh
+                end)
+                for _, c in ipairs(ctxOpts) do
+                    root:CreateRadio(CtxLabel(c), function()
+                        return inst.currentContext == c
+                    end, function()
+                        if inst.onContextPick then inst.onContextPick(c) end
+                        return MenuResponse.Refresh
+                    end)
+                end
+                root:CreateDivider()
+            end
+            local tiers = inst.tiersPresent
+            if tiers and #tiers > 0 then
+                root:CreateTitle("Tiers")
+                for _, tier in ipairs(tiers) do
+                    root:CreateCheckbox(tier, function()
+                        return not LoadHiddenTiers()[tier]
+                    end, function()
+                        ToggleHiddenTier(tier)
+                        if inst.onRefresh then inst.onRefresh() end
+                        return MenuResponse.Refresh
+                    end)
+                end
+                root:CreateDivider()
+            end
+            root:CreateTitle(L["settings.value.view"] or "View")
+            root:CreateRadio(L["settings.value.table"] or "Table", function()
+                return Trinkets.GetViewMode(ctx) == "table"
+            end, function()
+                Trinkets.SetViewMode("table", ctx)
+                return MenuResponse.Refresh
+            end)
+            root:CreateRadio(L["settings.value.list"] or "List", function()
+                return Trinkets.GetViewMode(ctx) == "list"
+            end, function()
+                Trinkets.SetViewMode("list", ctx)
+                return MenuResponse.Refresh
+            end)
+            root:CreateRadio(L["settings.value.icons"] or "Icons", function()
+                return Trinkets.GetViewMode(ctx) == "icons"
+            end, function()
+                Trinkets.SetViewMode("icons", ctx)
+                return MenuResponse.Refresh
+            end)
+            local gear = ns.Sections.Gear
+            if gear and gear.IsTrackTicksShown then
+                root:CreateDivider()
+                local tickCheck = root:CreateCheckbox(
+                    L["settings.label.gear_ticks"] or "Show Upgrade Track Ticks",
+                    function()
+                        return gear.IsTrackTicksShown(ctx)
+                    end,
+                    function()
+                        gear.SetTrackTicksShown(not gear.IsTrackTicksShown(ctx), ctx)
+                        if inst.onRefresh then inst.onRefresh() end
+                        return MenuResponse.Refresh
+                    end
+                )
+                if tickCheck and tickCheck.SetTooltip then
+                    tickCheck:SetTooltip(function(tip)
+                        ns.Tooltip.MenuTip(
+                            tip,
+                            L["settings.label.gear_ticks"] or "Show Upgrade Track Ticks",
+                            L["settings.hint.gear_ticks"]
+                                or "Ticks compare your equipped item with each Best in Slot or Trinkets row. Green means it has reached the row's item level. Yellow means it is below."
+                        )
+                    end)
+                end
+            end
+        end)
+    end)
+    cog:Hide()
+    inst.contextCog = cog
+end
 
--- args = { trinkets, onChange }
--- Returns the rendered row count (height in ROW_HEIGHT units).
-function Trinkets.RenderPanel(args)
-    for i = 1, MAX_ROWS do panel.rows[i]:Hide() end
-    if not args.trinkets or #args.trinkets == 0 then
-        panel.sourceDropdown:Hide()
-        panel.ctxDropdown:Hide()
+local function placeCog(inst, title)
+    local cog = inst.contextCog
+    if not cog then return end
+    if title then
+        cog:SetParent(title)
+        cog:ClearAllPoints()
+        if title.link then
+            cog:SetPoint("RIGHT", title.link, "LEFT", -3, 0)
+        else
+            cog:SetPoint("RIGHT", title, "RIGHT", -(ns.PAGE_TITLE_HPAD or 8), 0)
+        end
+    elseif inst.header and inst.header.AddHeaderWidget then
+        inst.header:AddHeaderWidget(cog)
+    end
+end
+
+local function makeIcon(inst)
+    local ic = ns.CreateSlotIcon(inst.content, { size = ICON_SIZE, slotSize = SLOT_FRAME })
+    ns.SetupItemTooltip(ic)
+    ic:Hide()
+    return ic
+end
+
+local function makeListRow(inst)
+    local row = CreateFrame("Frame", nil, inst.content)
+    row:SetHeight(LIST_ROW_H)
+    row.icon = ns.CreateSlotIcon(row, { size = ICON_SIZE, slotSize = SLOT_FRAME })
+    row.icon:SetPoint("LEFT", row, "LEFT", LIST_INSET_X, 0)
+    local tier = row.icon:CreateFontString(nil, "OVERLAY", nil, 7)
+    tier:SetFont(GameFontNormalSmall:GetFont(), 14, "OUTLINE")
+    tier:SetPoint("TOPLEFT", row.icon, "TOPLEFT", -3, 5)
+    tier:SetJustifyH("CENTER")
+    row.tierLabel = tier
+    local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    name:SetPoint("LEFT", row.icon.slot, "RIGHT", 4, 0)
+    name:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+    name:SetJustifyH("LEFT")
+    name:SetWordWrap(false)
+    row.itemText = name
+    ns.SetupItemTooltip(row)
+    row:Hide()
+    return row
+end
+
+local function buildRows(inst)
+    inst.icons = {}
+    for i = 1, MAX_ICONS do
+        inst.icons[i] = makeIcon(inst)
+    end
+    inst.listRows = {}
+    for i = 1, MAX_ICONS do
+        inst.listRows[i] = makeListRow(inst)
+    end
+    inst.tableRows = {}
+    for i = 1, MAX_ICONS do
+        inst.tableRows[i] = ns.MakeTableRow(inst.content)
+    end
+    inst.tierLabels = {}
+    for i = 1, MAX_TIERS do
+        local t = inst.content:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        t:SetJustifyH("CENTER")
+        t:SetWidth(TIER_LABEL_W)
+        t:Hide()
+        inst.tierLabels[i] = t
+    end
+end
+
+local function render(inst, args)
+    if not inst.icons then return 0 end
+    for i = 1, MAX_ICONS do
+        inst.icons[i]:Hide()
+        if inst.listRows and inst.listRows[i] then inst.listRows[i]:Hide() end
+        if inst.tableRows and inst.tableRows[i] then inst.tableRows[i]:Hide() end
+    end
+    for i = 1, MAX_TIERS do
+        inst.tierLabels[i]:Hide()
+    end
+
+    if not args or not args.trinkets or #args.trinkets == 0 then
+        if inst.contextCog then inst.contextCog:Hide() end
+        if inst.section then inst.section:Hide() end
         return 0
     end
 
-    local yOffset = 0
-
-    -- Source dropdown (top) — only when both sources carry trinkets for the spec.
-    local classToken, specKey = ns.GetClassAndSpec()
-    local hasIV  = SourceHasTrinkets("icyveins", classToken, specKey)
-    local hasUgg = SourceHasTrinkets("ugg", classToken, specKey)
-    if hasIV and hasUgg then
-        local labels = ns.TRINKET_SOURCE_LABELS or {}
-        local srcOpts = {
-            { label = labels.icyveins or "Icy Veins", value = "icyveins" },
-            { label = labels.ugg or "u.gg", value = "ugg" },
-        }
-        panel.sourceDropdown:ClearAllPoints()
-        panel.sourceDropdown:SetPoint("TOPLEFT", 0, yOffset)
-        panel.sourceDropdown:SetPoint("TOPRIGHT", 0, yOffset)
-        panel.sourceDropdown:Show()
-        panel.sourceDropdown:SetOptions(srcOpts, LoadSource(), function(picked)
-            SaveSource(picked)
-            if args.onChange then args.onChange() end
-        end)
-        yOffset = yOffset - 30
-    else
-        panel.sourceDropdown:Hide()
+    local contexts = CollectContexts(args.trinkets)
+    local ctxKey = LoadCtx()
+    if ctxKey ~= "All" then
+        local valid = false
+        for _, c in ipairs(contexts) do
+            if c == ctxKey then
+                valid = true
+                break
+            end
+        end
+        if not valid then
+            ctxKey = "All"
+            SaveCtx("All")
+        end
     end
 
-    -- Context dropdown (below the source dropdown).
-    local ctxKey = LoadCtx()
-    local contexts = CollectContexts(args.trinkets)
-    local showDropdown = #contexts > 1
-
-    if showDropdown then
-        local opts = { { label = "All", value = "All" } }
-        for _, c in ipairs(contexts) do
-            opts[#opts + 1] = { label = CtxLabel(c), value = c }
-        end
-        panel.ctxDropdown:ClearAllPoints()
-        panel.ctxDropdown:SetPoint("TOPLEFT", 0, yOffset)
-        panel.ctxDropdown:SetPoint("TOPRIGHT", 0, yOffset)
-        panel.ctxDropdown:Show()
-        panel.ctxDropdown:SetOptions(opts, ctxKey, function(picked)
-            SaveCtx(picked)
-            if args.onChange then args.onChange() end
-        end)
-        yOffset = yOffset - 30
-    else
-        panel.ctxDropdown:Hide()
+    inst.contextOptions = contexts
+    inst.currentContext = ctxKey
+    inst.onContextPick = function(picked)
+        SaveCtx(picked)
+        if args.onChange then args.onChange() end
+        if args.refresh then args.refresh() end
+    end
+    inst.onRefresh = function()
+        if args.onChange then args.onChange() end
+        if args.refresh then args.refresh() end
     end
 
     local filtered = FilterAndSort(args.trinkets, ctxKey)
-    local count = math.min(#filtered, MAX_ROWS)
+    if #filtered == 0 then
+        if inst.contextCog then inst.contextCog:Hide() end
+        if inst.section then inst.section:Hide() end
+        return 0
+    end
 
-    for i = 1, count do
-        local t = filtered[i]
-        local row = panel.rows[i]
-        row.tierText:SetText(t.tier)
-        SetTierColor(row.tierText, t.tier)
-        row.itemText:SetText(ns.FormatItem({ itemId = t.itemId, name = "" }))
-        row.itemId = t.itemId
-        row.bonusIDs = t.bonusIDs
-        row.altItemId = nil
-        row.embItemId = nil
-        row.sourceText = t.source or nil
-        row.sourceLabel:SetText(t.source or "")
-        ns.SizeSourceColumn(row.sourceLabel, row:GetParent():GetWidth(), 48, 92, 180)
-        ns.SetRowIcon(row, t.itemId)
-        if row.ownedBg then
-            if ns.IsItemOwned(t.itemId) then row.ownedBg:Show() else row.ownedBg:Hide() end
+    local tiersPresent, seenTier = {}, {}
+    for _, t in ipairs(filtered) do
+        -- Tierless entries (e.g. a flat "recommended" list) default to S so the
+        -- seenTier table below is never indexed with nil.
+        local tier = t.tier or "S"
+        t.tier = tier
+        if not seenTier[tier] then
+            seenTier[tier] = true
+            tiersPresent[#tiersPresent + 1] = tier
         end
-        row:ClearAllPoints()
-        row:SetPoint("TOPLEFT", 0, yOffset - (i - 1) * ns.ROW_HEIGHT)
-        row:SetPoint("RIGHT", 0, 0)
-        row:Show()
     end
-    panel.section:Show()
-    return count
+    inst.tiersPresent = tiersPresent
+    if inst.contextCog then inst.contextCog:Show() end
+
+    local hidden = LoadHiddenTiers()
+    local gear = ns.Sections.Gear
+    local ticksOn = gear and gear.IsTrackTicksShown and gear.IsTrackTicksShown(args._viewCtx)
+
+    if inst.header and inst.header.label then
+        local base = L["tab.trinkets"] or "Trinkets"
+        local selected = {}
+        for _, tier in ipairs(tiersPresent) do
+            if not hidden[tier] then selected[#selected + 1] = tier end
+        end
+        if #selected > 0 and #selected < #tiersPresent then
+            local parts = {}
+            for _, tier in ipairs(selected) do
+                local c = ns.TIER_COLORS and ns.TIER_COLORS[tier]
+                if c then
+                    parts[#parts + 1] = string.format("|cff%02x%02x%02x%s|r", c.r * 255, c.g * 255, c.b * 255, tier)
+                else
+                    parts[#parts + 1] = tier
+                end
+            end
+            inst.header.label:SetText(base .. " " .. ns.DOT_SEPARATOR .. " " .. table.concat(parts, ", "))
+        else
+            inst.header.label:SetText(base)
+        end
+    end
+
+    if Trinkets.GetViewMode(args._viewCtx) == "list" then
+        local rowIdx = 0
+        for _, t in ipairs(filtered) do
+            if not hidden[t.tier] and rowIdx < MAX_ICONS then
+                rowIdx = rowIdx + 1
+                local row = inst.listRows[rowIdx]
+                if row then
+                    row.itemId = t.itemId
+                    row.bonusIDs = t.bonusIDs
+                    row.altItemId = nil
+                    row.embItemId = nil
+                    row.sourceText = (t.source and t.source ~= "" and t.source)
+                        or (ns.GetTrinketSource and ns:GetTrinketSource(t.itemId))
+                        or nil
+                    row.popText = t.popularity and (t.popularity .. "%") or nil
+                    row.tierLabel:SetText(t.tier)
+                    SetTierColor(row.tierLabel, t.tier)
+                    row.itemText:SetText(t.itemId and ns.FormatItem({ itemId = t.itemId }) or "")
+                    row.icon:SetItem(t.itemId)
+                    local owned = ns.IsItemOwned(t.itemId)
+                    if inst.gateOwned then owned = owned and ns.compOwnClass end
+                    local tick = resolveTick(inst, ticksOn, t)
+                    if tick then owned = true end
+                    row.icon:ToggleMarker("owned", owned and true or false)
+                    row.icon:SetMarkerColor("owned", tick)
+                    row:ClearAllPoints()
+                    row:SetPoint("TOPLEFT", inst.content, "TOPLEFT", 0, -(rowIdx - 1) * LIST_ROW_H)
+                    row:SetPoint("RIGHT", inst.content, "RIGHT", 0, 0)
+                    row:Show()
+                end
+            end
+        end
+        local listH = rowIdx * LIST_ROW_H
+        ns.SetContentHeight(inst.content, math.max(listH, 1))
+        if inst.section then inst.section:Show() end
+        return #tiersPresent
+    end
+
+    if Trinkets.GetViewMode(args._viewCtx) == "table" then
+        local items = {}
+        for _, t in ipairs(filtered) do
+            if not hidden[t.tier] then
+                local tierColor = ns.TIER_COLORS and ns.TIER_COLORS[t.tier]
+                items[#items + 1] = {
+                    itemId = t.itemId,
+                    bonusIDs = t.bonusIDs,
+                    sourceText = (t.source and t.source ~= "" and t.source)
+                        or (ns.GetTrinketSource and ns:GetTrinketSource(t.itemId))
+                        or nil,
+                    popText = t.popularity and (t.popularity .. "%") or nil,
+                    isOwned = ns.IsItemOwned(t.itemId),
+                    tickColor = resolveTick(inst, ticksOn, t),
+                    label = t.tier,
+                    labelColor = tierColor and { tierColor.r, tierColor.g, tierColor.b } or nil,
+                }
+            end
+        end
+        local h = ns.LayoutTable(inst.content, inst.tableRows, items)
+        ns.SetContentHeight(inst.content, math.max(h, 1))
+        if inst.section then inst.section:Show() end
+        return #tiersPresent
+    end
+
+    local inset = 4
+    local width = inst.content:GetWidth()
+    if not width or width < 100 then width = args.width or (ns.GetPanelWidth and ns.GetPanelWidth()) or 300 end
+    local availW = width - inset - TIER_LABEL_W - 6
+    local perRow = math.max(1, math.floor(availW / ICON_STRIDE))
+
+    local y = -2
+    local iconIdx, tierIdx = 0, 0
+    local i = 1
+    while i <= #filtered and iconIdx < MAX_ICONS and tierIdx < MAX_TIERS do
+        local tier = filtered[i].tier
+        local group = {}
+        while i <= #filtered and filtered[i].tier == tier do
+            group[#group + 1] = filtered[i]
+            i = i + 1
+        end
+
+        if not hidden[tier] then
+            local numRows = math.ceil(#group / perRow)
+            tierIdx = tierIdx + 1
+            local tl = inst.tierLabels[tierIdx]
+            tl:SetText(tier)
+            SetTierColor(tl, tier)
+            tl:ClearAllPoints()
+            local labelY = y - ((numRows - 1) * ROW_STRIDE) / 2 - ICON_SIZE / 2
+            tl:SetPoint("LEFT", inst.content, "TOPLEFT", inset, labelY)
+            tl:Show()
+
+            for j, t in ipairs(group) do
+                iconIdx = iconIdx + 1
+                if iconIdx > MAX_ICONS then break end
+                local ic = inst.icons[iconIdx]
+                local rowN = math.floor((j - 1) / perRow)
+                local col = (j - 1) % perRow
+                local x = inset + TIER_LABEL_W + col * ICON_STRIDE
+                ic:ClearAllPoints()
+                ic:SetPoint("TOPLEFT", inst.content, "TOPLEFT", x, y - rowN * ROW_STRIDE)
+                ic:SetItem(t.itemId)
+                ic.itemId = t.itemId
+                ic.bonusIDs = t.bonusIDs
+                ic.altItemId = nil
+                ic.embItemId = nil
+                ic.sourceText = (t.source and t.source ~= "" and t.source)
+                    or (ns.GetTrinketSource and ns:GetTrinketSource(t.itemId))
+                    or nil
+                ic.popText = t.popularity and (t.popularity .. "%") or nil
+                local owned = ns.IsItemOwned(t.itemId)
+                if inst.gateOwned then owned = owned and ns.compOwnClass end
+                local tick = resolveTick(inst, ticksOn, t)
+                if tick then owned = true end
+                ic:ToggleMarker("owned", owned and true or false)
+                ic:SetMarkerColor("owned", tick)
+                ic:Show()
+            end
+
+            y = y - numRows * ROW_STRIDE - TIER_GAP
+        end
+    end
+
+    ns.SetContentHeight(inst.content, math.max(math.abs(y), 1))
+    if inst.section then inst.section:Show() end
+    return #tiersPresent
 end
 
--------------------------------------------------------------------------------
--- Compendium surface
--------------------------------------------------------------------------------
+local panel = {}
+local comp = { gateOwned = true }
 
-local comp = {}
--- Session-scoped Compendium trinket source (registry key), independent of the
--- panel's saved per-spec pref. Resets to Icy Veins when the browsed spec
--- changes — mirrors the BiS Compendium source model in Sections/Gear.lua.
-local compSource = "icyveins"
-local compLastSpecKey = nil
-
--- Resolve (and validate) the active Compendium trinket source for a spec.
--- Called by Compendium.lua before fetching, so the reset happens before the
--- data is read.
-function Trinkets.GetCompendiumSourceKey(classToken, specKey)
-    if specKey ~= compLastSpecKey then
-        compSource = "icyveins"
-        compLastSpecKey = specKey
-    end
-    if compSource == "icyveins" and not SourceHasTrinkets("icyveins", classToken, specKey) then
-        compSource = "ugg"
-    elseif compSource == "ugg" and not SourceHasTrinkets("ugg", classToken, specKey) then
-        compSource = "icyveins"
-    end
-    return compSource
+function Trinkets.InitPanel(parent, cogTitle)
+    panel.section, panel.header, panel.content = ns.CreateCollapsibleSection(parent, {
+        label = L["tab.trinkets"],
+        stateKey = "trinkets",
+        refresh = function()
+            if ns.LayoutPanel then ns:LayoutPanel() end
+        end,
+    })
+    panel.title = panel.header
+    makeCog(panel, nil)
+    placeCog(panel, cogTitle)
+    buildRows(panel)
+    return panel.section
 end
 
--- opts.parent + opts.headerFactory + opts.rowFactory (Compendium-side
--- MakeItemRow with click-to-link + tooltip)
+function Trinkets.RenderPanel(args)
+    args._viewCtx = nil
+    return render(panel, args)
+end
+
+function Trinkets.GetPanelFrames()
+    return {
+        section = panel.section,
+        content = panel.content,
+        collapsed = panel.section.IsCollapsed and panel.section.IsCollapsed() or false,
+    }
+end
+
 function Trinkets.InitCompendium(opts)
     comp.section = CreateFrame("Frame", nil, opts.parent)
     comp.header = opts.headerFactory(comp.section, L["tab.trinkets"], false)
     comp.content = CreateFrame("Frame", nil, comp.section)
-    comp.content:SetPoint("TOPLEFT", comp.header, "BOTTOMLEFT", 0, -2)
+    comp.content:SetPoint("TOPLEFT", comp.header, "BOTTOMLEFT", 0, 0)
     comp.content:SetPoint("RIGHT", 0, 0)
-
-    comp.rows = {}
-    for i = 1, MAX_ROWS do
-        local row = opts.rowFactory(comp.content)
-        local tier = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        tier:SetPoint("LEFT", 2, 0); tier:SetWidth(16); tier:SetJustifyH("CENTER")
-        row.tier = tier
-        ns.CreateRowIcon(row)
-        row.icon:ClearAllPoints()
-        row.icon:SetPoint("LEFT", tier, "RIGHT", 4, 0)
-        local src = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        src:SetPoint("RIGHT", -2, 0); src:SetWidth(120); src:SetJustifyH("RIGHT")
-        src:SetWordWrap(false); src:SetTextColor(0.5, 0.5, 0.5)
-        row.source = src
-        local name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        name:SetPoint("LEFT", row.icon, "RIGHT", 4, 0)
-        name:SetPoint("RIGHT", src, "LEFT", -4, 0)
-        name:SetJustifyH("LEFT"); name:SetWordWrap(false)
-        row.name = name
-        comp.rows[i] = row
-    end
-
-    comp.sourceDropdown = CreateFrame(
-        "DropdownButton", "ClassCodexCompTrinketSourceDD",
-        comp.content, "WowStyle1DropdownTemplate"
-    )
-    comp.sourceDropdown:SetPoint("TOPLEFT", 0, 0)
-    comp.sourceDropdown:SetPoint("TOPRIGHT", 0, 0)
-    comp.sourceDropdown:SetHeight(24)
-    comp.sourceDropdown:Hide()
-
-    comp.ctxDropdown = CreateFrame(
-        "DropdownButton", "ClassCodexCompTrinketCtxDD",
-        comp.content, "WowStyle1DropdownTemplate"
-    )
-    comp.ctxDropdown:SetPoint("TOPLEFT", 0, 0)
-    comp.ctxDropdown:SetPoint("TOPRIGHT", 0, 0)
-    comp.ctxDropdown:SetHeight(24)
-    comp.ctxDropdown:Hide()
-
+    makeCog(comp, "comp")
+    placeCog(comp, opts.cogTitle)
+    buildRows(comp)
     return comp.section, comp.header, comp.content
 end
 
--- args = { trinkets, class, specKey, refresh }
 function Trinkets.RenderCompendium(args)
-    if not args or not args.trinkets then return end
-    for i = 1, MAX_ROWS do comp.rows[i]:Hide() end
-
-    local dropH = 0
-
-    -- Source dropdown (top) — only when both sources carry trinkets for the spec.
-    if SourceHasTrinkets("icyveins", args.class, args.specKey)
-        and SourceHasTrinkets("ugg", args.class, args.specKey) then
-        local labels = ns.TRINKET_SOURCE_LABELS or {}
-        comp.sourceDropdown:SetupMenu(function(_, rootDescription)
-            for _, src in ipairs({ "icyveins", "ugg" }) do
-                rootDescription:CreateRadio(labels[src] or src,
-                    function() return compSource == src end,
-                    function()
-                        compSource = src
-                        if args.refresh then args.refresh() end
-                    end,
-                    src)
-            end
-        end)
-        comp.sourceDropdown:ClearAllPoints()
-        comp.sourceDropdown:SetPoint("TOPLEFT", 0, -dropH)
-        comp.sourceDropdown:SetPoint("TOPRIGHT", 0, -dropH)
-        comp.sourceDropdown:Show()
-        dropH = dropH + 30
-    else
-        comp.sourceDropdown:Hide()
-    end
-
-    local ctxKey = LoadCtx()
-    local contexts = CollectContexts(args.trinkets)
-    local showDropdown = #contexts > 1
-
-    if showDropdown then
-        local valid = ctxKey == "All"
-        if not valid then
-            for _, c in ipairs(contexts) do
-                if c == ctxKey then valid = true; break end
-            end
-        end
-        if not valid then ctxKey = "All"; SaveCtx("All") end
-
-        local allOptions = { "All" }
-        for _, c in ipairs(contexts) do allOptions[#allOptions + 1] = c end
-
-        comp.ctxDropdown:SetupMenu(function(_, rootDescription)
-            for _, ctx in ipairs(allOptions) do
-                local label = ctx == "All" and "All" or CtxLabel(ctx)
-                rootDescription:CreateRadio(label,
-                    function() return ctxKey == ctx end,
-                    function()
-                        SaveCtx(ctx)
-                        if args.refresh then args.refresh() end
-                    end,
-                    ctx)
-            end
-        end)
-        comp.ctxDropdown:ClearAllPoints()
-        comp.ctxDropdown:SetPoint("TOPLEFT", 0, -dropH)
-        comp.ctxDropdown:SetPoint("TOPRIGHT", 0, -dropH)
-        comp.ctxDropdown:Show()
-        dropH = dropH + 30
-    else
-        comp.ctxDropdown:Hide()
-    end
-
-    local filtered = FilterAndSort(args.trinkets, ctxKey)
-    local yOffset = -dropH
-    local idx = 0
-    for _, t in ipairs(filtered) do
-        idx = idx + 1
-        if idx > MAX_ROWS then break end
-        local row = comp.rows[idx]
-        row.tier:SetText(t.tier or "?")
-        SetTierColor(row.tier, t.tier)
-        row.name:SetText(ns.FormatItem({ itemId = t.itemId, name = t.name }))
-        row.itemId = t.itemId
-        row.bonusIDs = t.bonusIDs
-        row.source:SetText(t.source or "")
-        ns.SetRowIcon(row, t.itemId)
-        row:ClearAllPoints()
-        row:SetPoint("TOPLEFT", comp.content, "TOPLEFT", 0, yOffset - (idx - 1) * ns.ROW_HEIGHT)
-        row:SetPoint("RIGHT", comp.content, "RIGHT", 0, 0)
-        row:Show()
-    end
-    comp.content:SetHeight(dropH + idx * ns.ROW_HEIGHT)
-    comp.section:Show()
+    args._viewCtx = "comp"
+    return render(comp, args)
 end
 
 function Trinkets.GetCompendiumContentHeight()
-    local h = 0
-    if comp.sourceDropdown:IsShown() then h = h + 30 end
-    if comp.ctxDropdown:IsShown() then h = h + 30 end
-    for i = 1, MAX_ROWS do
-        if comp.rows[i]:IsShown() then h = h + ns.ROW_HEIGHT end
-    end
-    return h
+    return comp.content and (comp.content._stackHeight or comp.content:GetHeight()) or 0
 end
